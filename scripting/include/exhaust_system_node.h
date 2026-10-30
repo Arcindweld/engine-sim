@@ -37,6 +37,7 @@ namespace es_script {
             addInput("impulse_response", &m_impulseResponse, InputTarget::Type::Object);
 
             // 1-D gas-dynamics model (optional in scripts; defaults in objects.mr)
+            addInput("exhaust_model", &m_parameters.exhaustModel);
             addInput("legacy_exhaust", &m_parameters.legacy);
             addInput("primary_diameter", &m_parameters.primaryDiameter);
             addInput("collector_diameter", &m_parameters.collectorDiameter);

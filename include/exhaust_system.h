@@ -7,6 +7,7 @@
 #include "impulse_response.h"
 #include "exhaust_network.h"
 
+#include <string>
 #include <vector>
 
 class ExhaustSystem : public Part {
@@ -25,7 +26,10 @@ class ExhaustSystem : public Part {
 
             // 1-D gas-dynamics model (see docs/exhaust-1d.md).  All optional;
             // zero or negative means "derive from the legacy parameters".
-            bool legacy = false;              // true: lumped-volume model and per-cylinder audio delay
+            // exhaustModel: "auto" (1-D only when one of the geometry inputs
+            // below is set, legacy otherwise), "1d" or "legacy".
+            std::string exhaustModel = "auto";
+            bool legacy = false;              // alias for exhaustModel = "legacy"
             double primaryDiameter = 0.0;     // default: head exhaust_runner_cross_section_area
             double collectorDiameter = 0.0;   // default: collector_cross_section_area
             double collectorLength = -1.0;    // default: length
@@ -33,9 +37,16 @@ class ExhaustSystem : public Part {
             double megaphoneExitDiameter = 0.0;
             double tailpipeLength = 0.0;      // straight pipe after the cone (0 = none)
             double tailpipeDiameter = 0.0;    // default: the diameter it follows
-            double pipeCellSize = 0.04;       // m (see docs/exhaust-1d.md, performance)
+            double pipeCellSize = 0.0;        // m; 0 = default (DefaultPipeCellSize)
             double wallTemperature = 700.0;   // K
+
+            // true when any of the 1-D geometry inputs differs from its default
+            bool hasGeometry() const;
+            // the model that these parameters select
+            bool selectsLegacy() const;
         };
+
+        static constexpr double DefaultPipeCellSize = 0.04;   // m (see docs/exhaust-1d.md, performance)
 
     public:
         ExhaustSystem();

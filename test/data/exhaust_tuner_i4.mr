@@ -206,7 +206,11 @@ public node exhausttuner_inline_4 {
         es_params,
         length: 487.946 * units.mm,  // [spec] exhaust.systemL_mm (collector to tip)
         audio_volume: 0.5 * 8,  // [donor] assets/engines/atg-video-1/06_subaru_ej25.mr:216
-        impulse_response: ir_lib.mild_exhaust_0  // [donor] assets/engines/atg-video-1/06_subaru_ej25.mr:217
+        impulse_response: ir_lib.mild_exhaust_0,  // [donor] assets/engines/atg-video-1/06_subaru_ej25.mr:217
+        // 1-D exhaust geometry (docs/exhaust-1d.md); giving any of these selects the 1-D model
+        primary_diameter: 44.45 * units.mm,  // [spec] exhaust.primaryD_mm
+        collector_diameter: 79.515 * units.mm,  // [spec] exhaust.collectorD_mm
+        collector_length: 487.946 * units.mm  // [spec] exhaust.systemL_mm
     )
 
     cylinder_bank_parameters bank_params(

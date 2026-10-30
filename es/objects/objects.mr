@@ -553,8 +553,11 @@ public node exhaust_system_parameters {
     input velocity_decay: 1.0;
 
     // 1-D gas-dynamics exhaust (docs/exhaust-1d.md). All optional.
-    // legacy_exhaust: true restores the lumped-volume model and the
-    // per-cylinder audio delay of the original engine-sim.
+    // exhaust_model: "auto" uses the 1-D model only when one of the geometry
+    // inputs below is given and the lumped model of the original engine-sim
+    // otherwise; "1d" and "legacy" force one or the other.
+    input exhaust_model: "auto";
+    // legacy_exhaust: true is the same as exhaust_model: "legacy"
     input legacy_exhaust: false;
     // 0 = derive from the head's exhaust_runner_cross_section_area
     input primary_diameter: 0.0;
@@ -568,7 +571,8 @@ public node exhaust_system_parameters {
     // straight pipe after the cone (0 = none; diameter 0 = same as before it)
     input tailpipe_length: 0.0;
     input tailpipe_diameter: 0.0;
-    input pipe_cell_size: 4.0 * units.cm;
+    // 0 = default (4 cm); any value given counts as 1-D geometry for "auto"
+    input pipe_cell_size: 0.0;
     input wall_temperature: 700.0 * units.K;
 }
 
@@ -581,6 +585,7 @@ private node _exhaust_system => __engine_sim__exhaust_system {
     input audio_volume [float];
     input velocity_decay [float];
     input impulse_response [impulse_response];
+    input exhaust_model [string];
     input legacy_exhaust [bool];
     input primary_diameter [float];
     input collector_diameter [float];
@@ -604,6 +609,7 @@ public node exhaust_system {
     input audio_volume: parameters.audio_volume;
     input velocity_decay: parameters.velocity_decay;
     input impulse_response;
+    input exhaust_model: parameters.exhaust_model;
     input legacy_exhaust: parameters.legacy_exhaust;
     input primary_diameter: parameters.primary_diameter;
     input collector_diameter: parameters.collector_diameter;
@@ -624,6 +630,7 @@ public node exhaust_system {
             audio_volume: audio_volume,
             velocity_decay: velocity_decay,
             impulse_response: impulse_response,
+            exhaust_model: exhaust_model,
             legacy_exhaust: legacy_exhaust,
             primary_diameter: primary_diameter,
             collector_diameter: collector_diameter,
