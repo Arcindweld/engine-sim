@@ -1,10 +1,9 @@
 #include "../include/synthesizer.h"
 
 #include "../include/utilities.h"
-#include "../include/delta.h"
-
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 
 #undef min
 #undef max
