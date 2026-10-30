@@ -1,0 +1,67 @@
+name: Windows build
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+  VCPKG_DEFAULT_TRIPLET: x64-windows
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Flex and Bison
+        run: choco install winflexbison3 --no-progress -y
+
+      - name: Install SDL2, SDL2_image and Boost.Filesystem (vcpkg)
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install sdl2 sdl2-image boost-filesystem --triplet x64-windows
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+          "SDL2DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows" >> $env:GITHUB_ENV
+          "SDL2IMAGEDIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows" >> $env:GITHUB_ENV
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -B build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DDISCORD_ENABLED=OFF `
+            -DBoost_USE_STATIC_LIBS=ON `
+            -DCMAKE_BUILD_TYPE=$env:BUILD_TYPE
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --target engine-sim-app
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "package/engine-sim-arcindweld"
+          New-Item -ItemType Directory -Force -Path "$out/bin" | Out-Null
+          $exe = Get-ChildItem -Recurse -Filter engine-sim-app.exe build | Select-Object -First 1
+          Copy-Item $exe.FullName "$out/bin/"
+          # runtime DLLs vcpkg copied next to the exe (SDL2, SDL2_image and their dependencies)
+          Get-ChildItem -Path $exe.DirectoryName -Filter *.dll | Copy-Item -Destination "$out/bin/"
+          Copy-Item -Recurse assets "$out/assets"
+          Copy-Item -Recurse es "$out/es"
+          New-Item -ItemType Directory -Force -Path "$out/basic" | Out-Null
+          Copy-Item -Recurse dependencies/submodules/delta-studio/engines/basic/shaders "$out/basic/shaders"
+          Copy-Item -Recurse dependencies/submodules/delta-studio/engines/basic/fonts "$out/basic/fonts"
+          Copy-Item -Recurse dependencies/submodules/delta-studio/dependencies/runtime/x64/* "$out/bin/" -ErrorAction SilentlyContinue
+          Set-Content -Path "$out/bin/delta.conf" -Value "../basic`n../assets" -NoNewline
+          Copy-Item LICENSE "$out/"
+          Get-ChildItem -Recurse $out | Select-Object -ExpandProperty FullName | Out-File package/files.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-sim-windows-x64
+          path: package/
