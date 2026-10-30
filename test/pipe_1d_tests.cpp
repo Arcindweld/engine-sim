@@ -132,33 +132,31 @@ TEST(Pipe1DTests, QuarterWaveResonance) {
         pipe.setCellState(i, rho0 * std::pow(p / Patm, 1 / 1.4), 0.0, p, AtmScalars);
     }
 
-    // sample at a fixed rate for a DFT
-    const double fs = 50000.0, duration = 0.3;
+    // fixed time step (half the CFL step of the gas at rest; the pulse is
+    // small so the signal speed hardly changes) and one sample per step
+    pipe.computePrimitives();
+    const double dt = 0.5 * cflStep(pipe);
+    const double fs = 1.0 / dt, duration = 0.5;
     std::vector<double> samples;
-    double t = 0, nextSample = 0;
+    double t = 0;
     while (t < duration) {
-        pipe.computePrimitives();
         pipe.applyWallEnd(-1);
         pipe.applyOpenEnd(+1, Patm, Tatm, AtmScalars);
-        const double dt = std::min(cflStep(pipe), nextSample - t > 0 ? nextSample - t : cflStep(pipe));
         pipe.advance(dt);
         t += dt;
-        if (t >= nextSample - 1e-12) {
-            pipe.computePrimitives();
-            samples.push_back(pipe.pressure(0) - Patm);
-            nextSample += 1.0 / fs;
-        }
+        samples.push_back(pipe.pressure(0) - Patm);
     }
 
-    // DFT magnitude search between 20 Hz and 500 Hz (0.5 Hz steps)
+    // DFT magnitude search between 20 Hz and 500 Hz (0.5 Hz steps), Hann window
     double bestF = 0, bestMag = -1;
     const int n = static_cast<int>(samples.size());
     for (double f = 20; f <= 500; f += 0.5) {
         double re = 0, im = 0;
         for (int k = 0; k < n; ++k) {
+            const double w = 0.5 - 0.5 * std::cos(2 * 3.14159265358979323846 * k / (n - 1.0));
             const double ph = 2 * 3.14159265358979323846 * f * k / fs;
-            re += samples[k] * std::cos(ph);
-            im -= samples[k] * std::sin(ph);
+            re += w * samples[k] * std::cos(ph);
+            im -= w * samples[k] * std::sin(ph);
         }
         const double mag = re * re + im * im;
         if (mag > bestMag) { bestMag = mag; bestF = f; }
@@ -211,6 +209,7 @@ TEST(Pipe1DTests, JunctionPressureAndMassBalance) {
         const double p = Patm + 2000.0 * g;
         a.setCellState(i, rho0 * std::pow(p / Patm, 1 / 1.4), 0.0, p, AtmScalars);
     }
+    a.computePrimitives();
     const double m0 = net.totalMass();
 
     // probes: incident half-pulse in A at x = 0.4 m (before the junction

@@ -568,7 +568,7 @@ public node exhaust_system_parameters {
     // straight pipe after the cone (0 = none; diameter 0 = same as before it)
     input tailpipe_length: 0.0;
     input tailpipe_diameter: 0.0;
-    input pipe_cell_size: 2.0 * units.cm;
+    input pipe_cell_size: 4.0 * units.cm;
     input wall_temperature: 700.0 * units.K;
 }
 

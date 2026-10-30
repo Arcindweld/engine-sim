@@ -18,10 +18,10 @@
 
 namespace {
     constexpr double Pi = 3.14159265358979323846;
-    // Largest share of the end cell's mass that one port exchange may draw back
-    // into the port volume; keeps the explicit coupling bounded when the pipe
-    // end is at a much higher pressure than the port.
-    constexpr double MaxReverseCellFraction = 0.05;
+    // Largest share of the end cell's mass that one port exchange (one fluid
+    // sub-step) may draw back into the port volume; keeps the explicit
+    // coupling bounded when the pipe end is at a much higher pressure.
+    constexpr double MaxReverseCellFraction = 0.2;
     // Same role as the 0.9 clamp in GasSystem::flow for the port volume.
     constexpr double MaxForwardMoleFraction = 0.9;
 }
@@ -46,7 +46,6 @@ ExhaustNetwork::~ExhaustNetwork() {
 int ExhaustNetwork::addPrimary(const PrimarySpec &spec) {
     Primary prim;
     prim.spec = spec;
-    for (int k = 0; k < Pipe1D::FluxCount; ++k) prim.accumulated[k] = prim.averaged[k] = 0.0;
     prim.jetSpeed = 0.0;
     prim.lastMassFlow = 0.0;
     m_primaries.push_back(prim);
@@ -154,7 +153,11 @@ double ExhaustNetwork::jetSpeed(double p0, double T0, double pd) const {
 }
 
 // Flow between the port GasSystem and the first cell of the primary
-// (reference: valveFlow + fedEnd).  Positive mass flow = into the pipe.
+// (reference: valveFlow, and the chamber coupling that adds the exchanged
+// mass straight to the cell).  Positive mass flow = into the pipe.  Both
+// sides are updated at once, at the fluid sub-step rate, so the orifice
+// always sees the current pressures on both sides; the pipe's inlet face is
+// then a wall during the pipe step.
 void ExhaustNetwork::exchangePort(int index, double dt) {
     Primary &prim = m_primaries[index];
     GasSystem *port = prim.spec.port;
@@ -171,7 +174,6 @@ void ExhaustNetwork::exchangePort(int index, double dt) {
     const double Tr = port->temperature();
     const double M = m_params.molarMass;
     const double CdA = prim.spec.orificeArea;
-    const double af = P.endFaceArea(-1);
 
     double m = 0.0, h = 0.0, uj = 0.0;
     double x[Pipe1D::ScalarCount] = { 0.0, 0.0 };
@@ -180,8 +182,7 @@ void ExhaustNetwork::exchangePort(int index, double dt) {
     if (p0 > pr) {
         // pipe -> port
         m = -orificeFlow(CdA, p0, T0, pr);
-        const double cellMass = r * P.cellArea(i) * P.cellSize();
-        const double limit = MaxReverseCellFraction * cellMass / dt;
+        const double limit = MaxReverseCellFraction * P.cellMass(i) / dt;
         if (-m > limit) m = -limit;
         h = m_cp * T0;
         for (int k = 0; k < Pipe1D::ScalarCount; ++k) x[k] = P.scalar(i, k);
@@ -198,40 +199,38 @@ void ExhaustNetwork::exchangePort(int index, double dt) {
         x[1] = mix.p_o2;
     }
 
+    if (m == 0.0) {
+        prim.lastMassFlow = 0.0;
+        return;
+    }
+
+    const double dm = m * dt;
+    double dScalars[Pipe1D::ScalarCount];
+    for (int k = 0; k < Pipe1D::ScalarCount; ++k) dScalars[k] = dm * x[k];
+
     if (m > 0) {
-        const double dn = m * dt / M;
+        const double dn = dm / M;
         // internal energy leaves with the gas (as in GasSystem::flow) plus the
         // flow work p v = R T per mole, so the pipe receives the full enthalpy
         port->loseN(dn, port->kineticEnergyPerMol());
         port->changeEnergy(-dn * constants::R * Tr);
+        // the jet brings its momentum in the +x direction
+        P.addToCell(i, dm, dm * uj, dm * h, dScalars);
+        prim.jetSpeed = std::max(prim.jetSpeed, uj);
     }
-    else if (m < 0) {
-        const double dn = -m * dt / M;
+    else {
+        const double dn = -dm / M;
         mix.p_fuel = x[0];
         mix.p_o2 = x[1];
         mix.p_inert = std::max(0.0, 1.0 - x[0] - x[1]);
         // the port is a fixed volume: the incoming enthalpy becomes internal energy
         port->gainN(dn, h * M, mix);
+        // the gas that leaves takes its share of the cell's momentum
+        P.addToCell(i, dm, dm * u, dm * h, dScalars);
     }
 
-    const bool entering = m > 0;
-    const double uf = entering ? uj : m / (r * af);
-    prim.accumulated[0] += m * dt;
-    prim.accumulated[1] += m * uf * dt;
-    prim.accumulated[2] += m * h * dt;
-    for (int k = 0; k < Pipe1D::ScalarCount; ++k) prim.accumulated[3 + k] += m * x[k] * dt;
-    if (entering) prim.jetSpeed = std::max(prim.jetSpeed, uj);
     prim.lastMassFlow = m;
-    m_massIn += m * dt;
-}
-
-void ExhaustNetwork::applyPortFlux(Primary &prim) {
-    double F[Pipe1D::FluxCount];
-    F[0] = prim.averaged[0];
-    F[1] = prim.averaged[1] + prim.pipe.pressure(0) * prim.pipe.endFaceArea(-1);
-    F[2] = prim.averaged[2];
-    for (int k = 0; k < Pipe1D::ScalarCount; ++k) F[3 + k] = prim.averaged[3 + k];
-    prim.pipe.setEndFlux(-1, F);
+    m_massIn += dm;
 }
 
 // Two pipes of different area meeting end to end (reference: junction).
@@ -385,7 +384,9 @@ void ExhaustNetwork::junctionN(JunctionEnd *ends, int count, Junction &jn) const
 }
 
 void ExhaustNetwork::applyBoundaries() {
-    for (Primary &prim : m_primaries) applyPortFlux(prim);
+    // the port exchange adds its mass to the first cell directly; the inlet
+    // face itself is closed
+    for (Primary &prim : m_primaries) prim.pipe.applyWallEnd(-1);
     junctionN(m_junctionEnds.data(), static_cast<int>(m_junctionEnds.size()), m_junction);
     for (size_t q = 1; q < m_collector.size(); ++q) {
         junction2(*m_collector[q - 1], *m_collector[q], m_collectorJunctions[q]);
@@ -397,13 +398,6 @@ void ExhaustNetwork::applyBoundaries() {
 void ExhaustNetwork::step(double dt) {
     if (!m_built || !(dt > 0)) return;
 
-    for (Primary &prim : m_primaries) {
-        for (int k = 0; k < Pipe1D::FluxCount; ++k) {
-            prim.averaged[k] = prim.accumulated[k] / dt;
-            prim.accumulated[k] = 0.0;
-        }
-    }
-
     double dxMin = m_collector[0]->cellSize();
     for (const Primary &prim : m_primaries) dxMin = std::min(dxMin, prim.pipe.cellSize());
     for (const Pipe1D *p : m_collector) dxMin = std::min(dxMin, p->cellSize());
@@ -412,16 +406,17 @@ void ExhaustNetwork::step(double dt) {
     double outflow = 0.0;
     double remaining = dt;
     int subSteps = 0;
+    // The primitive state is kept current by Pipe1D::advance(); only the
+    // initial state after build() or a setCellState() needs computePrimitives().
     while (remaining > 1e-15) {
+        // (the port jet enters the first cell as a source, so its own speed
+        // does not bound the face fluxes; the cell's velocity after the
+        // exchange is already in maxSignalSpeed())
         double smax = 0.0;
         for (Primary &prim : m_primaries) {
-            prim.pipe.computePrimitives();
             smax = std::max(smax, prim.pipe.maxSignalSpeed());
-            const double c0 = prim.pipe.soundSpeed(prim.pipe.pressure(0), prim.pipe.density(0));
-            smax = std::max(smax, prim.jetSpeed + c0);
         }
         for (Pipe1D *p : m_collector) {
-            p->computePrimitives();
             smax = std::max(smax, p->maxSignalSpeed());
         }
         const double dtCfl = m_params.cfl * dxMin / std::max(smax, 1.0);
@@ -436,11 +431,7 @@ void ExhaustNetwork::step(double dt) {
         ++subSteps;
         if (subSteps > 10000) break;   // safety against a stalled CFL loop
     }
-    for (Primary &prim : m_primaries) {
-        prim.pipe.computePrimitives();
-        prim.jetSpeed = 0.0;
-    }
-    for (Pipe1D *p : m_collector) p->computePrimitives();
+    for (Primary &prim : m_primaries) prim.jetSpeed = 0.0;   // diagnostic only
 
     const double massFlow = outflow / dt;
     m_outletMassFlowDerivative = (massFlow - m_outletMassFlow) / dt;
