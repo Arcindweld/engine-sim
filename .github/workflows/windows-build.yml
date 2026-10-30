@@ -82,9 +82,8 @@ jobs:
         shell: pwsh
         run: |
           Push-Location package/engine-sim-arcindweld
-          $mr = Get-ChildItem es -Recurse -Filter *.mr | Where-Object { $_.FullName -match 'engines' } | Select-Object -First 1
-          "engine file: $($mr.FullName)"
-          & bin/engine-sim-headless.exe $mr.FullName --sim 3 --hold-rpm 3000 --gain 0.35 --wav ../smoke.wav --json ../smoke.json
+          # assets/main.mr is the app's own entry file (imports the default engine and calls main())
+          & bin/engine-sim-headless.exe assets/main.mr --sim 3 --hold-rpm 3000 --gain 0.35 --wav ../smoke.wav --json ../smoke.json
           if ($LASTEXITCODE -ne 0) { throw "headless run failed: $LASTEXITCODE" }
           Pop-Location
           Get-Content package/smoke.json -Raw
