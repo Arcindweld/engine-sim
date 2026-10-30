@@ -355,4 +355,8 @@ if (PIRANHA_ENABLED)
         engine-sim-script-interpreter
         engine-sim
     )
+
+    # it includes "scripting/include/..." and "include/..." from the repository root
+    target_include_directories(engine-sim-headless
+        PRIVATE ${PROJECT_SOURCE_DIR})
 endif (PIRANHA_ENABLED)
