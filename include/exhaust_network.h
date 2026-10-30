@@ -122,6 +122,7 @@ class ExhaustNetwork {
         bool m_built;
 
         double m_gamma, m_R, m_cp;
+        double m_prc, m_psic;       // critical pressure ratio and choked flow function
         double m_atmScalars[Pipe1D::ScalarCount];
 
         double m_outletMassFlow;

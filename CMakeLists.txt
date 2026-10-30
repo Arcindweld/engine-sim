@@ -315,6 +315,7 @@ add_executable(engine-sim-test
     test/function_test.cpp
     test/synthesizer_tests.cpp
     test/pipe_1d_tests.cpp
+    test/exhaust_network_tests.cpp
 )
 
 target_link_libraries(engine-sim-test
@@ -324,3 +325,22 @@ target_link_libraries(engine-sim-test
 
 include(GoogleTest)
 gtest_discover_tests(engine-sim-test)
+
+if (PIRANHA_ENABLED)
+    # Engine-level tests that compile the shipped scripts; they need the
+    # repository root for es/ and assets/.
+    add_executable(engine-sim-script-test
+        test/exhaust_engine_tests.cpp
+    )
+
+    target_compile_definitions(engine-sim-script-test
+        PRIVATE ENGINE_SIM_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+
+    target_link_libraries(engine-sim-script-test
+        gtest_main
+        engine-sim-script-interpreter
+        engine-sim
+    )
+
+    gtest_discover_tests(engine-sim-script-test)
+endif (PIRANHA_ENABLED)
