@@ -29,6 +29,15 @@ jobs:
           "SDL2DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows" >> $env:GITHUB_ENV
           "SDL2IMAGEDIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows" >> $env:GITHUB_ENV
 
+      # Boost 1.84 removed boost::filesystem::path::is_complete(); piranha (pinned upstream) still calls it once.
+      # is_absolute() is the documented replacement. Local builds against Boost 1.84+ need the same one-line change.
+      - name: Patch piranha for Boost 1.84+
+        shell: pwsh
+        run: |
+          $f = "dependencies/submodules/piranha/src/path.cpp"
+          (Get-Content $f) -replace 'is_complete\(\)', 'is_absolute()' | Set-Content $f
+          Select-String -Path $f -Pattern 'is_absolute' | ForEach-Object { $_.Line }
+
       - name: Configure
         shell: pwsh
         run: |
@@ -57,6 +66,9 @@ jobs:
           Copy-Item -Recurse dependencies/submodules/delta-studio/engines/basic/shaders "$out/basic/shaders"
           Copy-Item -Recurse dependencies/submodules/delta-studio/engines/basic/fonts "$out/basic/fonts"
           Copy-Item -Recurse dependencies/submodules/delta-studio/dependencies/runtime/x64/* "$out/bin/" -ErrorAction SilentlyContinue
+          # Visual C++ runtime next to the exe, as the upstream release ships it (msvcp140, vcruntime140, vcruntime140_1)
+          $crt = Get-ChildItem -Path "C:/Program Files/Microsoft Visual Studio/2022/*/VC/Redist/MSVC/*/x64/Microsoft.VC143.CRT" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($crt) { Get-ChildItem -Path $crt.FullName -Filter *.dll | Copy-Item -Destination "$out/bin/" } else { Write-Warning "VC143 CRT redist not found" }
           Set-Content -Path "$out/bin/delta.conf" -Value "../basic`n../assets" -NoNewline
           Copy-Item LICENSE "$out/"
           Get-ChildItem -Recurse $out | Select-Object -ExpandProperty FullName | Out-File package/files.txt
