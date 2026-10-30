@@ -49,7 +49,9 @@ jobs:
             -DCMAKE_BUILD_TYPE=$env:BUILD_TYPE
 
       - name: Build
-        run: cmake --build build --config ${{ env.BUILD_TYPE }} --target engine-sim-app
+        run: |
+          cmake --build build --config ${{ env.BUILD_TYPE }} --target engine-sim-app
+          cmake --build build --config ${{ env.BUILD_TYPE }} --target engine-sim-headless
 
       - name: Package
         shell: pwsh
@@ -58,6 +60,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$out/bin" | Out-Null
           $exe = Get-ChildItem -Recurse -Filter engine-sim-app.exe build | Select-Object -First 1
           Copy-Item $exe.FullName "$out/bin/"
+          $hl = Get-ChildItem -Recurse -Filter engine-sim-headless.exe build | Select-Object -First 1
+          Copy-Item $hl.FullName "$out/bin/"
           # runtime DLLs vcpkg copied next to the exe (SDL2, SDL2_image and their dependencies)
           Get-ChildItem -Path $exe.DirectoryName -Filter *.dll | Copy-Item -Destination "$out/bin/"
           Copy-Item -Recurse assets "$out/assets"
@@ -72,6 +76,18 @@ jobs:
           Set-Content -Path "$out/bin/delta.conf" -Value "../basic`n../assets" -NoNewline
           Copy-Item LICENSE "$out/"
           Get-ChildItem -Recurse $out | Select-Object -ExpandProperty FullName | Out-File package/files.txt
+
+      # the headless runner on a shipped engine: it must compile, run and write a sound file
+      - name: Headless smoke test
+        shell: pwsh
+        run: |
+          Push-Location package/engine-sim-arcindweld
+          # assets/main.mr is the app's own entry file (imports the default engine and calls main())
+          & bin/engine-sim-headless.exe assets/main.mr --sim 3 --hold-rpm 3000 --gain 0.35 --wav ../smoke.wav --json ../smoke.json
+          if ($LASTEXITCODE -ne 0) { throw "headless run failed: $LASTEXITCODE" }
+          Pop-Location
+          Get-Content package/smoke.json -Raw
+          "{0:N0} bytes of sound" -f (Get-Item package/smoke.wav).Length
 
       - uses: actions/upload-artifact@v4
         with:

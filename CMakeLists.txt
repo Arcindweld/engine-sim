@@ -343,4 +343,20 @@ if (PIRANHA_ENABLED)
     )
 
     gtest_discover_tests(engine-sim-script-test)
+
+    # Headless runner: compiles an engine file, runs it at a held speed or throttle and writes the sound to a WAV
+    # and the run to JSON, without the window. Exhaust Tuner (Arcindweld/exhaust-tuner) calls it. Run it with the
+    # repository's es/ folder as the working directory (the scripts import from es/).
+    add_executable(engine-sim-headless
+        tools/headless/engine_sim_headless.cpp
+    )
+
+    target_link_libraries(engine-sim-headless
+        engine-sim-script-interpreter
+        engine-sim
+    )
+
+    # it includes "scripting/include/..." and "include/..." from the repository root
+    target_include_directories(engine-sim-headless
+        PRIVATE ${PROJECT_SOURCE_DIR})
 endif (PIRANHA_ENABLED)
