@@ -29,6 +29,15 @@ jobs:
           "SDL2DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows" >> $env:GITHUB_ENV
           "SDL2IMAGEDIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows" >> $env:GITHUB_ENV
 
+      # Boost 1.84 removed boost::filesystem::path::is_complete(); piranha (pinned upstream) still calls it once.
+      # is_absolute() is the documented replacement. Local builds against Boost 1.84+ need the same one-line change.
+      - name: Patch piranha for Boost 1.84+
+        shell: pwsh
+        run: |
+          $f = "dependencies/submodules/piranha/src/path.cpp"
+          (Get-Content $f) -replace 'is_complete\(\)', 'is_absolute()' | Set-Content $f
+          Select-String -Path $f -Pattern 'is_absolute' | ForEach-Object { $_.Line }
+
       - name: Configure
         shell: pwsh
         run: |
