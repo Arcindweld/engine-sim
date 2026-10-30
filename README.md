@@ -8,13 +8,42 @@ simple-2d-constraint-solver `e009f4f`). The upstream README is kept as `UPSTREAM
 The fork exists to pair the simulator with the Arcindweld exhaust and intake design calculator, which exports
 `.mr` engine files for it. Work planned here, in order:
 
-1. **1-D exhaust model** (branch `exhaust-1d`): primaries, collector and tailpipe as pipes with real wave
+1. **1-D exhaust model** (done, see below): primaries, collector and tailpipe as pipes with real wave
    propagation, sound taken at the tailpipe end, so header length and collector design change the sound and
    the torque curve the way they do on a car. Legacy mode stays available and unchanged.
 2. **Flow coefficients from geometry**: valve, port and pipe discharge coefficients from the engine's own
    dimensions instead of per-file guesses (the exporter already ships donor orifice ratings because ideal
    orifices gave a mild 350 small-block 913 hp).
 3. **Performance**: profiling and the hot loops.
+
+## 1-D exhaust
+
+Merged from branch `exhaust-1d`; full description in `docs/exhaust-1d.md`. Each `exhaust_system` can be
+solved as a network of one-dimensional pipes (quasi-1-D Euler equations, MUSCL-Hancock + HLLC, wall friction
+and heat transfer): one primary per cylinder (`primary_tube_length` + the cylinder's `primary_length`), a
+constant-pressure junction, a collector with an optional megaphone cone and tailpipe, and an open end. The
+sound is taken from the tailpipe exit (monopole, d(mass flow)/dt) and still goes through `audio_volume` and the
+impulse response. Pipe length, diameter and collector design then change the sound and the torque curve.
+
+Parameters on `exhaust_system` / `exhaust_system_parameters`, all optional:
+
+* `exhaust_model`: `"auto"` (default) runs the 1-D model only when one of the geometry inputs below is given,
+  so the shipped engines and existing files run the original lumped model unchanged; `"1d"` and `"legacy"`
+  force one or the other. `legacy_exhaust: true` is the same as `"legacy"`.
+* `primary_diameter` (default: from the head's `exhaust_runner_cross_section_area`), `collector_diameter`
+  (from `collector_cross_section_area`), `collector_length` (default `length`), `megaphone_length`,
+  `megaphone_exit_diameter`, `tailpipe_length`, `tailpipe_diameter`, `pipe_cell_size` (default 4 cm),
+  `wall_temperature` (700 K).
+
+Cost: the CPU time scales with `1 / pipe_cell_size^2`. With 4 cm cells a V8 with two 4-1 headers at
+`simulation_frequency: 10000` costs about 2x the lumped model; 2 cm cells about 5x (resolving up to ~2-3 kHz
+instead of ~1-1.5 kHz). Use 6 cm on a slow machine, 2 cm when the torque numbers matter.
+
+Known limits: the torque above about 6000 rpm depends on the cell size (2 cm and 4 cm can differ by 10-20%
+there; 2 cm is the smoother result); 4-1 headers show a low-rpm torque hole that is real but exaggerated
+(no junction losses, lumped intake runner, fixed wall temperature); the per-cylinder `sound_attenuation` is
+not applied to 1-D systems; cones are linear tapers, there are no crossovers, mufflers or catalysts (the
+impulse response still does that).
 
 ## Downloads
 

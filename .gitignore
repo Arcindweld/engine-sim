@@ -10,3 +10,8 @@ compile_commands.json
 
 # Blender temporary files
 *.blend1
+
+# Script compiler log and temporary test scripts
+error_log.log
+test_*_tmp.mr
+test_tune_*.mr
