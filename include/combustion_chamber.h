@@ -105,6 +105,7 @@ class CombustionChamber : public atg_scs::ForceGenerator {
         double m_lastTimestepTotalExhaustFlow;
         double m_lastTimestepTotalIntakeFlow;
         double m_exhaustFlow;
+        int m_exhaustPrimaryIndex;
 
         double m_crankcasePressure;
 

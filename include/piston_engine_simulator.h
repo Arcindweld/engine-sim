@@ -20,6 +20,10 @@
 
 class PistonEngineSimulator : public Simulator {
     public:
+        // Gain applied to the 1-D model's radiated pressure (Pa at 1 m) before
+        // it enters the synthesizer; see writeToSynthesizer().
+        static constexpr double SoundSourceGain = 1.0e5;
+
         PistonEngineSimulator();
         virtual ~PistonEngineSimulator() override;
 
