@@ -88,7 +88,7 @@ TEST(Pipe1DTests, ClosedOpenPipePulseReflection) {
     }
 
     double t = 0;
-    double tMin = 0, pMin = 1e30, tMax = 0, pMax = -1e30;
+    double tMin = 0, pMin = 1e30, pMax = -1e30;
     const int probe = 0;   // closed end
     while (t < 2.6 * L / c) {
         pipe.computePrimitives();
@@ -102,7 +102,7 @@ TEST(Pipe1DTests, ClosedOpenPipePulseReflection) {
         // ignore the initial pulse itself (first 0.4 L/c)
         if (t > 0.8 * L / c) {
             if (p < pMin) { pMin = p; tMin = t; }
-            if (p > pMax) { pMax = p; tMax = t; }
+            if (p > pMax) pMax = p;
         }
     }
     // Reflection from the open end inverts the pulse: a rarefaction arrives at the wall.

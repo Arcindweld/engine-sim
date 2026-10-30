@@ -31,6 +31,8 @@ ExhaustNetwork::ExhaustNetwork() {
     m_gamma = 1.4;
     m_R = 287.0;
     m_cp = m_gamma / (m_gamma - 1) * m_R;
+    m_prc = std::pow(2 / (m_gamma + 1), m_gamma / (m_gamma - 1));
+    m_psic = std::sqrt(m_gamma) * std::pow(2 / (m_gamma + 1), (m_gamma + 1) / (2 * (m_gamma - 1)));
     m_atmScalars[0] = m_atmScalars[1] = 0.0;
     m_outletMassFlow = 0.0;
     m_outletMassFlowDerivative = 0.0;
@@ -57,6 +59,8 @@ void ExhaustNetwork::build(const Parameters &params) {
     m_gamma = 1.0 + 2.0 / params.degreesOfFreedom;
     m_R = constants::R / params.molarMass;
     m_cp = m_gamma / (m_gamma - 1) * m_R;
+    m_prc = std::pow(2 / (m_gamma + 1), m_gamma / (m_gamma - 1));
+    m_psic = std::sqrt(m_gamma) * std::pow(2 / (m_gamma + 1), (m_gamma + 1) / (2 * (m_gamma - 1)));
 
     // The legacy model treats the air outside the exhaust as inert (ExhaustSystem::process)
     m_atmScalars[0] = 0.0;   // fuel
@@ -133,23 +137,24 @@ void ExhaustNetwork::build(const Parameters &params) {
 double ExhaustNetwork::orificeFlow(double CdA, double p0, double T0, double pd) const {
     if (!(CdA > 0) || !(p0 > pd) || !(T0 > 0)) return 0.0;
     const double g = m_gamma, g1 = g - 1;
-    const double prc = std::pow(2 / (g + 1), g / g1);
     const double pr = pd / p0;
     const double rho0 = p0 / (m_R * T0);
     double psi;
-    if (pr <= prc) {
-        psi = std::sqrt(g) * std::pow(2 / (g + 1), (g + 1) / (2 * g1));
+    if (pr <= m_prc) {
+        psi = m_psic;
     }
     else {
-        psi = std::sqrt(std::max(0.0, 2 * g / g1 * (std::pow(pr, 2 / g) - std::pow(pr, (g + 1) / g))));
+        // pr^(2/g) and pr^((g+1)/g) = pr^(2/g) * pr^((g-1)/g)
+        const double a = std::pow(pr, 2 / g);
+        const double b = a * std::pow(pr, g1 / g);
+        psi = std::sqrt(std::max(0.0, 2 * g / g1 * (a - b)));
     }
     return CdA * std::sqrt(p0 * rho0) * psi;
 }
 
 double ExhaustNetwork::jetSpeed(double p0, double T0, double pd) const {
     const double g = m_gamma, g1 = g - 1;
-    const double prc = std::pow(2 / (g + 1), g / g1);
-    return std::sqrt(std::max(0.0, 2 * m_cp * T0 * (1 - std::pow(std::max(pd / p0, prc), g1 / g))));
+    return std::sqrt(std::max(0.0, 2 * m_cp * T0 * (1 - std::pow(std::max(pd / p0, m_prc), g1 / g))));
 }
 
 // Flow between the port GasSystem and the first cell of the primary
@@ -246,28 +251,36 @@ void ExhaustNetwork::junction2(Pipe1D &a, Pipe1D &b, Junction &jn) const {
     const double k2 = 2 / g1, ex = g1 / (2 * g), ig = 1 / g;
     const double JL = uL + k2 * cL, JR = uR - k2 * cR;
 
-    auto mismatch = [&](double ps) {
-        const double sL = ps / pL, sR = ps / pR;
-        const double c1 = cL * std::pow(sL, ex), c2 = cR * std::pow(sR, ex);
-        return A1 * rL * std::pow(sL, ig) * (JL - k2 * c1) - A2 * rR * std::pow(sR, ig) * (JR + k2 * c2);
+    // mass flow mismatch g(ps) = A1 rho1 u1 - A2 rho2 u2 with rho = rho0 s^ig,
+    // c = c0 s^ex, s = ps / p0; note s^ig = (s^ex)^(2/(g-1)) = (s^ex)^k2, and
+    // dg/dps follows analytically from d(rho u)/dps = rho (ig u -/+ k2 ex c) / ps
+    auto mismatch = [&](double ps, double *derivative) {
+        const double sLe = std::pow(ps / pL, ex), sRe = std::pow(ps / pR, ex);
+        const double c1 = cL * sLe, c2 = cR * sRe;
+        const double r1 = rL * std::pow(sLe, k2), r2 = rR * std::pow(sRe, k2);
+        const double u1 = JL - k2 * c1, u2 = JR + k2 * c2;
+        if (derivative) {
+            *derivative = (A1 * r1 * (ig * u1 - k2 * ex * c1) - A2 * r2 * (ig * u2 + k2 * ex * c2)) / ps;
+        }
+        return A1 * r1 * u1 - A2 * r2 * u2;
     };
 
     double ps = jn.pressure > 0 ? jn.pressure : 0.5 * (pL + pR);
     bool ok = false;
     for (int it = 0; it < 8; ++it) {
-        const double gv = mismatch(ps), hh = ps * 1e-6;
-        const double d = (mismatch(ps + hh) - gv) / hh;
+        double d;
+        const double gv = mismatch(ps, &d);
         if (!(d < 0)) break;
         const double nx = ps - gv / d;
         if (!(nx > 0)) break;
         if (std::fabs(nx - ps) < 1e-7 * ps) { ps = nx; ok = true; break; }
         ps = nx;
     }
-    if (!ok || !(std::fabs(mismatch(ps)) <= 1e-6 * std::fabs(A1 * rL * cL))) {
+    if (!ok || !(std::fabs(mismatch(ps, nullptr)) <= 1e-6 * std::fabs(A1 * rL * cL))) {
         double lo = std::min(pL, pR) * 0.2, hi = std::max(pL, pR) * 5;
         for (int it = 0; it < 60; ++it) {
             const double mid = 0.5 * (lo + hi);
-            if (mismatch(mid) > 0) lo = mid; else hi = mid;
+            if (mismatch(mid, nullptr) > 0) lo = mid; else hi = mid;
         }
         ps = 0.5 * (lo + hi);
     }
@@ -318,27 +331,37 @@ void ExhaustNetwork::junctionN(JunctionEnd *ends, int count, Junction &jn) const
         pSum += E[k].p;
     }
 
-    // mass flow into the junction from end k at junction pressure ps
-    auto inflow = [&](int k, double ps) {
+    // mass flow into the junction from end k at junction pressure ps, and its
+    // derivative: s = ps / p_k, c = c_k s^ex, rho = rho_k s^ig = rho_k (s^ex)^k2,
+    // d(rho u)/dps = rho (ig u -/+ k2 ex c) / ps
+    auto inflow = [&](int k, double ps, double *derivative) {
         const int side = ends[k].side;
-        const double s = ps / E[k].p;
-        const double c = E[k].c * std::pow(s, ex);
-        const double r = E[k].r * std::pow(s, ig);
+        const double se = std::pow(ps / E[k].p, ex);
+        const double c = E[k].c * se;
+        const double r = E[k].r * std::pow(se, k2);
         const double u = side > 0 ? E[k].J - k2 * c : E[k].J + k2 * c;
         E[k].cs = c; E[k].us = u; E[k].rs = r;
+        if (derivative) {
+            *derivative = side * E[k].A * r * (ig * u + (side > 0 ? -1.0 : 1.0) * k2 * ex * c) / ps;
+        }
         return side * r * u * E[k].A;
     };
-    auto mismatch = [&](double ps) {
-        double t = 0;
-        for (int k = 0; k < count; ++k) t += inflow(k, ps);
+    auto mismatch = [&](double ps, double *derivative) {
+        double t = 0, d = 0;
+        for (int k = 0; k < count; ++k) {
+            double dk;
+            t += inflow(k, ps, derivative ? &dk : nullptr);
+            if (derivative) d += dk;
+        }
+        if (derivative) *derivative = d;
         return t;
     };
 
     double ps = jn.pressure > 0 ? jn.pressure : pSum / count;
     bool ok = false;
     for (int it = 0; it < 10; ++it) {
-        const double gv = mismatch(ps), hh = ps * 1e-6;
-        const double d = (mismatch(ps + hh) - gv) / hh;
+        double d;
+        const double gv = mismatch(ps, &d);
         if (!(d < 0)) break;
         const double nx = ps - gv / d;
         if (!(nx > 0)) break;
@@ -349,12 +372,12 @@ void ExhaustNetwork::junctionN(JunctionEnd *ends, int count, Junction &jn) const
         double lo = pMin * 0.2, hi = pMax * 5;
         for (int it = 0; it < 60; ++it) {
             const double mid = 0.5 * (lo + hi);
-            if (mismatch(mid) > 0) lo = mid; else hi = mid;
+            if (mismatch(mid, nullptr) > 0) lo = mid; else hi = mid;
         }
         ps = 0.5 * (lo + hi);
     }
     jn.pressure = ps;
-    mismatch(ps);
+    mismatch(ps, nullptr);
 
     double mIn = 0, hIn = 0, xIn[Pipe1D::ScalarCount] = { 0.0, 0.0 };
     for (int k = 0; k < count; ++k) {
