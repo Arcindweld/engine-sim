@@ -37,6 +37,7 @@ CombustionChamber::CombustionChamber() {
     m_intakeFlowRate = 0;
 
     m_fuel = nullptr;
+    m_exhaustPrimaryIndex = -1;
 }
 
 CombustionChamber::~CombustionChamber() {
@@ -95,8 +96,24 @@ void CombustionChamber::initialize(const Parameters &params) {
     const double exhaustRunnerWidth = std::sqrt(exhaustRunnerCrossSection);
     const double exhaustTubeLength =
         exhaust->getPrimaryTubeLength() + m_head->getHeaderPrimaryLength(m_piston->getCylinderIndex());
-    const double exhaustTubeVolume = exhaustRunnerCrossSection * exhaustTubeLength;
-    const double totalExhaustRunnerVolume = m_head->getExhaustRunnerVolume() + exhaustTubeVolume;
+    double totalExhaustRunnerVolume;
+    if (exhaust->isLegacy()) {
+        // Lumped model: the runner volume holds the port and the whole primary tube.
+        const double exhaustTubeVolume = exhaustRunnerCrossSection * exhaustTubeLength;
+        totalExhaustRunnerVolume = m_head->getExhaustRunnerVolume() + exhaustTubeVolume;
+    }
+    else {
+        // 1-D model: the primary tube is a pipe of its own; the lumped volume
+        // is only the head's exhaust port, which feeds the pipe's first cell.
+        // Floor at one cell's worth of volume so a zero port volume still works.
+        const double minimumPortVolume = exhaustRunnerCrossSection * units::distance(2.0, units::cm);
+        totalExhaustRunnerVolume = std::fmax(m_head->getExhaustRunnerVolume(), minimumPortVolume);
+        m_exhaustPrimaryIndex = exhaust->attachPrimary(
+            &m_exhaustRunnerAndPrimary,
+            exhaustTubeLength,
+            exhaustRunnerCrossSection,
+            exhaust->getPrimaryFlowRate());
+    }
     const double overallExhaustRunnerLength = totalExhaustRunnerVolume / exhaustRunnerCrossSection;
     m_exhaustRunnerAndPrimary.initialize(
         units::pressure(1.0, units::atm),
@@ -291,14 +308,20 @@ void CombustionChamber::flow(double dt) {
     m_system.dissipateExcessVelocity();
     m_exhaustRunnerAndPrimary.dissipateExcessVelocity();
 
-    flowParams.k_flow = m_primaryToCollectorFlowRate;
-    flowParams.crossSectionArea_0 = m_head->getExhaustRunnerCrossSectionArea();
-    flowParams.crossSectionArea_1 = exhaust->getCollectorCrossSectionArea();
-    flowParams.direction_x = 1.0;
-    flowParams.direction_y = 0.0;
-    flowParams.system_0 = &m_exhaustRunnerAndPrimary;
-    flowParams.system_1 = exhaust->getSystem();
-    GasSystem::flow(flowParams);
+    if (exhaust->isLegacy()) {
+        flowParams.k_flow = m_primaryToCollectorFlowRate;
+        flowParams.crossSectionArea_0 = m_head->getExhaustRunnerCrossSectionArea();
+        flowParams.crossSectionArea_1 = exhaust->getCollectorCrossSectionArea();
+        flowParams.direction_x = 1.0;
+        flowParams.direction_y = 0.0;
+        flowParams.system_0 = &m_exhaustRunnerAndPrimary;
+        flowParams.system_1 = exhaust->getSystem();
+        GasSystem::flow(flowParams);
+    }
+    else {
+        // port volume <-> first cell of this cylinder's primary pipe
+        exhaust->exchangePort(m_exhaustPrimaryIndex, dt);
+    }
 
     m_intakeRunnerAndManifold.updateVelocity(dt, intake->getVelocityDecay());
     m_system.updateVelocity(dt, 0.5);
