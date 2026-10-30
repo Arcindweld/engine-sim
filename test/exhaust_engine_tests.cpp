@@ -147,8 +147,8 @@ std::string readFile(const std::string &path) {
     return s;
 }
 
-// Insert `, legacy_exhaust: true` after every impulse_response argument.
-std::string legacyVariant(std::string s) {
+// Insert `, <input>` after every impulse_response argument of a script.
+std::string withExhaustInput(std::string s, const std::string &input) {
     size_t pos = 0;
     while ((pos = s.find("impulse_response:", pos)) != std::string::npos) {
         size_t end = pos + 17;
@@ -164,11 +164,14 @@ std::string legacyVariant(std::string s) {
         // trim trailing spaces of the expression
         size_t e = end;
         while (e > pos && s[e - 1] == ' ') --e;
-        s.insert(e, ", legacy_exhaust: true");
-        pos = e + 22;
+        s.insert(e, ", " + input);
+        pos = e + 2 + input.size();
     }
     return s;
 }
+
+std::string legacyVariant(const std::string &s) { return withExhaustInput(s, "legacy_exhaust: true"); }
+std::string oneDVariant(const std::string &s) { return withExhaustInput(s, "exhaust_model: \"1d\""); }
 
 struct ShippedEngine {
     const char *file;
@@ -219,15 +222,26 @@ class EngineTests : public ::testing::Test {
 
 } // namespace
 
-// (f) Every shipped engine compiles and runs without NaN; the ones that start
-// within the cranking time make positive torque on the dyno.  The Merlin V12
-// does not start in this headless start sequence with either exhaust model
-// (it needs a longer crank than this test allows), so it is only checked for
-// NaN.
-TEST_F(EngineTests, ShippedEnginesRun) {
+// (f) Every shipped engine, forced to the 1-D model (`exhaust_model: "1d"`
+// inserted into a copy of its file), compiles and runs without NaN; the ones
+// that start within the cranking time make positive torque on the dyno.  The
+// Merlin V12 does not start in this headless start sequence with either
+// exhaust model (it needs a longer crank than this test allows), so it is
+// only checked for NaN.
+TEST_F(EngineTests, ShippedEnginesRunWithOneDModel) {
     int started = 0, total = 0;
     for (const ShippedEngine &e : shippedEngines) {
-        const std::string path = writeScript("test_shipped_tmp.mr", scriptFor(e));
+        // the copy lives in the repository root: make the radials' local import absolute
+        std::string text = oneDVariant(readFile(std::string("assets/engines/") + e.file));
+        const std::string dir = std::string(e.file).substr(0, std::string(e.file).find('/'));
+        for (size_t at; (at = text.find("import \"radial.mr\"")) != std::string::npos;) {
+            text.replace(at, 18, "import \"assets/engines/" + dir + "/radial.mr\"");
+        }
+        std::ofstream("test_shipped_engine_tmp.mr") << text;
+        std::string script = "import \"engine_sim.mr\"\nimport \"test_shipped_engine_tmp.mr\"\n";
+        if (e.node == nullptr) script += "main()\n";
+        else script += "set_engine(" + std::string(e.node) + "())\nset_vehicle(vehicle())\nset_transmission(transmission())\n";
+        const std::string path = writeScript("test_shipped_tmp.mr", script);
         const RunResult r = runScript(path, 2.0, 2500.0, 1.5);
         ++total;
         std::cout << "[  values  ] " << e.file << ": cells " << r.cells
@@ -236,7 +250,7 @@ TEST_F(EngineTests, ShippedEnginesRun) {
                   << r.massImbalance << "\n";
         EXPECT_TRUE(r.compiled) << e.file;
         EXPECT_FALSE(r.nan) << e.file;
-        EXPECT_FALSE(r.legacy) << e.file << " should use the 1-D model by default";
+        EXPECT_FALSE(r.legacy) << e.file << " was forced to the 1-D model";
         if (r.started) {
             ++started;
             EXPECT_GT(r.meanTorque, 0.0) << e.file;
@@ -244,7 +258,73 @@ TEST_F(EngineTests, ShippedEnginesRun) {
         }
     }
     std::remove("test_shipped_tmp.mr");
+    std::remove("test_shipped_engine_tmp.mr");
     EXPECT_GE(started, total - 2);
+}
+
+namespace {
+    // compile a script and report whether every exhaust system is legacy / 1-D
+    void exhaustModes(const std::string &path, int *legacyCount, int *oneDCount) {
+        *legacyCount = *oneDCount = 0;
+        es_script::Compiler compiler;
+        compiler.initialize();
+        ASSERT_TRUE(compiler.compile(path.c_str())) << path;
+        const es_script::Compiler::Output output = compiler.execute();
+        ASSERT_NE(output.engine, nullptr);
+        Engine *engine = output.engine;
+        engine->createSimulator(output.vehicle, output.transmission);
+        for (int e = 0; e < engine->getExhaustSystemCount(); ++e) {
+            ExhaustSystem *ex = engine->getExhaustSystem(e);
+            if (ex->isLegacy()) ++*legacyCount; else ++*oneDCount;
+            EXPECT_EQ(ex->isNetworkBuilt(), !ex->isLegacy());
+        }
+        compiler.destroy();
+    }
+}
+
+// exhaust_model "auto" (the default): a shipped engine, which gives none of
+// the 1-D geometry inputs, runs the legacy model; the calculator export in
+// test/data, which gives primary_diameter etc., runs the 1-D model; "1d",
+// "legacy" and legacy_exhaust: true force the choice.
+TEST_F(EngineTests, AutoModelSelection) {
+    int legacy = 0, oneD = 0;
+
+    writeScript("test_auto_tmp.mr", "import \"engine_sim.mr\"\nimport \"assets/engines/atg-video-1/06_subaru_ej25.mr\"\nmain()\n");
+    exhaustModes("test_auto_tmp.mr", &legacy, &oneD);
+    EXPECT_EQ(legacy, 2);
+    EXPECT_EQ(oneD, 0);
+
+    // (the calculator export is a complete script that calls main() itself)
+    exhaustModes("test/data/exhaust_tuner_i4.mr", &legacy, &oneD);
+    EXPECT_EQ(legacy, 0);
+    EXPECT_EQ(oneD, 1);
+
+    const std::string ej25 = readFile("assets/engines/atg-video-1/06_subaru_ej25.mr");
+    const std::string i4 = readFile("test/data/exhaust_tuner_i4.mr");
+    struct Case { std::string text; const char *tag; int legacy, oneD; };
+    const Case cases[] = {
+        { oneDVariant(ej25), "ej25 forced 1d", 0, 2 },
+        { withExhaustInput(ej25, "exhaust_model: \"legacy\""), "ej25 explicit legacy", 2, 0 },
+        { legacyVariant(ej25), "ej25 legacy_exhaust alias", 2, 0 },
+        { withExhaustInput(i4, "exhaust_model: \"legacy\""), "i4 forced legacy", 1, 0 },
+        { legacyVariant(i4), "i4 legacy_exhaust alias", 1, 0 },
+        { withExhaustInput(ej25, "pipe_cell_size: 4 * units.cm"), "ej25 with pipe_cell_size", 0, 2 },
+    };
+    for (const Case &c : cases) {
+        const bool complete = c.text.find("\nmain()") != std::string::npos;   // calls main() itself
+        if (complete) {
+            writeScript("test_auto_tmp.mr", c.text);
+        }
+        else {
+            std::ofstream("test_auto_engine_tmp.mr") << c.text;
+            writeScript("test_auto_tmp.mr", "import \"engine_sim.mr\"\nimport \"test_auto_engine_tmp.mr\"\nmain()\n");
+        }
+        exhaustModes("test_auto_tmp.mr", &legacy, &oneD);
+        EXPECT_EQ(legacy, c.legacy) << c.tag;
+        EXPECT_EQ(oneD, c.oneD) << c.tag;
+    }
+    std::remove("test_auto_tmp.mr");
+    std::remove("test_auto_engine_tmp.mr");
 }
 
 // (g) legacy_exhaust: true keeps the lumped model: no network is built, the

@@ -1,11 +1,14 @@
 # One-dimensional exhaust gas dynamics (`exhaust-1d`)
 
-This branch replaces the lumped-volume exhaust of engine-sim with a
-one-dimensional, compressible, unsteady gas-dynamics model of the header
-and collector. Header geometry (primary length and diameter, collector
-diameter and length, a megaphone cone, a tailpipe) now changes both the
-engine's breathing and the sound. The old model is kept behind
-`legacy_exhaust: true`.
+This branch adds a one-dimensional, compressible, unsteady gas-dynamics
+model of the header and collector next to the lumped-volume exhaust of
+engine-sim. Header geometry (primary length and diameter, collector diameter
+and length, a megaphone cone, a tailpipe) then changes both the engine's
+breathing and the sound. Selection is per exhaust system with
+`exhaust_model`: `"auto"` (the default) runs the 1-D model only for files
+that give 1-D geometry, so the shipped engines keep their behaviour
+bit-for-bit and calculator exports get the new model; `"1d"` and `"legacy"`
+force it.
 
 Files: `include/pipe_1d.h`, `src/pipe_1d.cpp` (duct solver),
 `include/exhaust_network.h`, `src/exhaust_network.cpp` (primaries, junction,
@@ -161,28 +164,29 @@ network built from their legacy parameters.
 
 | input | default | meaning |
 |---|---|---|
-| `legacy_exhaust` | `false` | `true`: lumped model and per-cylinder audio delay exactly as before |
+| `exhaust_model` | `"auto"` | `"auto"`: 1-D when any of the geometry inputs below (`primary_diameter` ... `pipe_cell_size`) is given, legacy otherwise; `"1d"` / `"legacy"`: force |
+| `legacy_exhaust` | `false` | `true`: same as `exhaust_model: "legacy"` (lumped model and per-cylinder audio delay exactly as before) |
 | `primary_diameter` | 0 = derived | diameter of every primary; derived from the head's `exhaust_runner_cross_section_area` |
 | `collector_diameter` | 0 = derived | derived from `collector_cross_section_area` |
 | `collector_length` | -1 = `length` | collector pipe from the junction to the cone/tailpipe/exit |
 | `megaphone_length`, `megaphone_exit_diameter` | 0 = none | cone after the collector |
 | `tailpipe_length`, `tailpipe_diameter` | 0 = none / same diameter | straight pipe after the cone |
-| `pipe_cell_size` | 4 cm | target cell size; a pipe has at least 6 and at most 200 cells |
+| `pipe_cell_size` | 0 = 4 cm | target cell size; a pipe has at least 6 and at most 200 cells (giving it, even 4 cm, selects the 1-D model in `"auto"`) |
 | `wall_temperature` | 700 K | wall temperature for the heat-transfer source |
 
 Per-cylinder primary length = `primary_tube_length` + that cylinder's
 `primary_length` (both existed before). `outlet_flow_rate` and
 `velocity_decay` are legacy-only.
 
-Why the new model is the default: the purpose of the branch is that header
-geometry changes the sound and the torque, old files get a sensible network
-without edits, and `legacy_exhaust: true` is a one-line way back for A/B
-listening and regression checks. Two consequences for old files to know
-about:
+Why `"auto"`: the shipped engines and every existing user file keep running
+exactly as before (section 4, test g), while a file that describes its
+header in 1-D terms (the calculator exports do) gets the new model without a
+switch. `exhaust_model: "1d"` turns it on for an old file; it then builds its
+network from the legacy parameters. Two things to know when doing that:
 
 * `length` was often a volume fudge (the `exhaust_system_parameters` default
   is `volume / collector_cross_section_area` = 100 L / 81 cm^2 = 12.3 m). A
-  12 m collector is now a 12 m pipe. It still works (the 200-cell cap makes
+  12 m collector becomes a 12 m pipe. It still works (the 200-cell cap makes
   its cells 6 cm) but costs time; set `collector_length` to the real value.
 * torque curves change (section 6): 4-1 headers now show their tuning
   effects, including the low-rpm hole.
@@ -208,20 +212,24 @@ Unit and network tests (`engine-sim-test`):
 Engine-level tests (`engine-sim-script-test`):
 
 * (f) all 25 shipped engines (`assets/engines/*/*.mr`; the five older files
-  through `set_engine(...)`) compile, build their networks and run 2 s of
+  through `set_engine(...)`), forced to the 1-D model with
+  `exhaust_model: "1d"`, compile, build their networks and run 2 s of
   cranking plus 1.5 s on the dyno at 2500 rpm without NaN; 23 start within the
   2 s crank and make positive torque (30 to 620 N m). The radial-9 and the
   Merlin V12 need a longer crank than the test gives them, in both models
   (the radial-9 starts with 6 s of cranking and makes 778 N m at 2000 rpm;
   the Merlin did not start in 8 s with either model in this harness).
 * (g) `legacy_exhaust: true` on the EJ25: no network is built, the runner
-  volume equals the legacy formula, the engine runs. Bit-identity with the
-  pre-change code was checked outside the test suite with the same
-  comparison program built against the pre-change tree (commit 36ad6a2) and
-  against this branch: 3 s runs of the EJ25 (hold 3500 rpm) and the GM LS
-  (hold 4000 rpm) printed rpm, torque, cylinder and runner pressures and the
-  cumulative synthesizer input every 0.1 s with 17 significant digits;
-  the two outputs are identical.
+  volume equals the legacy formula, the engine runs. `AutoModelSelection`:
+  the EJ25 as shipped runs legacy, the calculator export in `test/data` runs
+  1-D, `"1d"`, `"legacy"`, `legacy_exhaust: true` and a lone `pipe_cell_size`
+  select as documented. Bit-identity with the pre-change code was checked
+  outside the test suite with the same comparison program built against the
+  pre-change tree (commit 36ad6a2) and against this branch: 3 s runs of the
+  EJ25 (hold 3500 rpm) and the GM LS (hold 4000 rpm), both as shipped (auto)
+  and with `legacy_exhaust: true`, printed rpm, torque, cylinder and runner
+  pressures and the cumulative synthesizer input every 0.1 s with 17
+  significant digits; the outputs are identical.
 * physics: see section 6.
 
 Pre-existing: upstream's own `GasSystemTests.PressureEquilibriumMaxFlow*`

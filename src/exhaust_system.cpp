@@ -57,7 +57,27 @@ void ExhaustSystem::initialize(const Parameters &params) {
     m_primaryTubeLength = params.primaryTubeLength;
 
     m_parameters = params;
-    m_legacy = params.legacy;
+    m_legacy = params.selectsLegacy();
+}
+
+bool ExhaustSystem::Parameters::hasGeometry() const {
+    return primaryDiameter > 0
+        || collectorDiameter > 0
+        || collectorLength >= 0
+        || megaphoneLength > 0
+        || megaphoneExitDiameter > 0
+        || tailpipeLength > 0
+        || tailpipeDiameter > 0
+        || pipeCellSize > 0;
+}
+
+bool ExhaustSystem::Parameters::selectsLegacy() const {
+    if (legacy) return true;
+    if (exhaustModel == "legacy") return true;
+    if (exhaustModel == "1d") return false;
+    // "auto" (and anything unrecognised): the 1-D model only when the file
+    // describes 1-D geometry
+    return !hasGeometry();
 }
 
 void ExhaustSystem::destroy() {
@@ -113,7 +133,7 @@ void ExhaustSystem::buildNetwork() {
     const Parameters &p = m_parameters;
 
     ExhaustNetwork::Parameters np;
-    np.cellSize = (p.pipeCellSize > 0) ? p.pipeCellSize : 0.04;
+    np.cellSize = (p.pipeCellSize > 0) ? p.pipeCellSize : DefaultPipeCellSize;
     np.wallTemperature = p.wallTemperature;
     np.atmosphericPressure = units::pressure(1.0, units::atm);
     np.atmosphericTemperature = units::celcius(25.0);
