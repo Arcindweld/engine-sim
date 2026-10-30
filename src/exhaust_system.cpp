@@ -113,7 +113,7 @@ void ExhaustSystem::buildNetwork() {
     const Parameters &p = m_parameters;
 
     ExhaustNetwork::Parameters np;
-    np.cellSize = (p.pipeCellSize > 0) ? p.pipeCellSize : 0.02;
+    np.cellSize = (p.pipeCellSize > 0) ? p.pipeCellSize : 0.04;
     np.wallTemperature = p.wallTemperature;
     np.atmosphericPressure = units::pressure(1.0, units::atm);
     np.atmosphericTemperature = units::celcius(25.0);

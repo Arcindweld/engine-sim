@@ -37,7 +37,7 @@ class Pipe1D {
 
         struct Parameters {
             std::vector<Section> sections;  // contiguous; a diameter jump belongs between two pipes
-            double cellSize = 0.02;         // m, target; the actual size is length / cellCount
+            double cellSize = 0.04;         // m, target; the actual size is length / cellCount
             int minCells = 6;
             int maxCells = 200;             // long pipes are coarsened so a run never exceeds this
             double wallTemperature = 700.0; // K
@@ -88,7 +88,8 @@ class Pipe1D {
         inline double temperature(int i) const { return m_p[i] / (m_R * m_r[i]); }
         inline double scalar(int i, int k) const { return m_x[k][i]; }
         State state(int i) const;
-        double maxSignalSpeed() const;      // max |u| + c over the cells
+        // max |u| + c over the cells, cached by computePrimitives() and advance()
+        inline double maxSignalSpeed() const { return m_maxSignalSpeed; }
 
         // End fluxes (per face, already multiplied by the face area): mass,
         // momentum, energy, scalars.  side = -1 is the left end (x = 0),
@@ -98,11 +99,11 @@ class Pipe1D {
         void applyWallEnd(int side);
         // Open end to still gas at (pAtm, TAtm) with the given scalar fractions
         void applyOpenEnd(int side, double pAtm, double TAtm, const double *scalarsAtm);
-        // Ghost state used by applyOpenEnd (exposed for tests)
-        State openEndGhost(int side, double pAtm, double TAtm, const double *scalarsAtm) const;
 
-        // One MUSCL-Hancock step.  Requires computePrimitives() and both end
-        // fluxes for the current state.
+        // One MUSCL-Hancock step.  Requires the primitive state (from
+        // initialize(), computePrimitives() or the previous advance()) and both
+        // end fluxes for the current state.  Leaves the primitive state and
+        // maxSignalSpeed() updated for the new state.
         void advance(double dt);
 
         // Diagnostics
@@ -116,6 +117,10 @@ class Pipe1D {
 
         // Direct state manipulation for tests and initial conditions
         void setCellState(int i, double rho, double u, double p, const double *scalars);
+        // Add mass (kg), momentum (kg m/s), energy (J) and scalar mass (kg) to
+        // one cell and refresh its primitive state (used by the port coupling).
+        void addToCell(int i, double dMass, double dMomentum, double dEnergy, const double *dScalarMass);
+        inline double cellMass(int i) const { return m_q1[i] * m_dx; }
 
     private:
         static inline double minmod(double a, double b) {
@@ -131,13 +136,15 @@ class Pipe1D {
         double m_friction;
 
         std::vector<double> m_A, m_Af, m_D;
+        std::vector<double> m_invA, m_invD, m_invR;
+        double m_invDx, m_invG1;
         std::vector<double> m_q1, m_q2, m_q3;
         std::vector<double> m_qs[ScalarCount];
         std::vector<double> m_r, m_u, m_p;
         std::vector<double> m_x[ScalarCount];
-        std::vector<double> m_dr, m_du, m_dp;
-        std::vector<double> m_dxs[ScalarCount];
+        std::vector<State> m_bL, m_bR;           // evolved face states of each cell
         std::vector<double> m_f[FluxCount];      // face fluxes, size n + 1
+        double m_maxSignalSpeed;
         double m_avgMassFlow[2];
 };
 

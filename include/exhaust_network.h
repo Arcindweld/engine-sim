@@ -8,10 +8,10 @@
 // cylinder's exhaust-port GasSystem (the lumped runner volume that the cylinder
 // already flows into) through a compressible orifice whose effective area is
 // derived from the script's `primary_flow_rate`.  The port exchange runs at the
-// fluid sub-step rate (it only needs the pipe's end state); the pipes advance
-// once per simulation step with their own CFL sub-stepping, driven by the
-// port fluxes averaged over that step.  Mass and energy that leave a port
-// GasSystem arrive in the pipe exactly.
+// fluid sub-step rate and updates the port volume and the pipe's first cell
+// at once; the pipes then advance once per simulation step with their own
+// CFL sub-stepping.  Mass and energy that leave a port GasSystem arrive in the
+// pipe exactly.
 
 #ifndef ATG_ENGINE_SIM_EXHAUST_NETWORK_H
 #define ATG_ENGINE_SIM_EXHAUST_NETWORK_H
@@ -25,7 +25,7 @@ class ExhaustNetwork {
     public:
         struct Parameters {
             std::vector<Pipe1D::Section> collectorSections;  // from the junction to the open end
-            double cellSize = 0.02;
+            double cellSize = 0.04;
             int maxCellsPerPipe = 200;
             double wallTemperature = 700.0;
             double frictionFactor = 0.005;
@@ -47,10 +47,8 @@ class ExhaustNetwork {
         struct Primary {
             PrimarySpec spec;
             Pipe1D pipe;
-            double accumulated[Pipe1D::FluxCount];   // advective flux x time since the last step
-            double averaged[Pipe1D::FluxCount];      // the same per unit time, used during the step
-            double jetSpeed;                          // largest jet speed seen since the last step
-            double lastMassFlow;                      // kg/s into the pipe, last exchange
+            double jetSpeed;         // largest jet speed seen since the last step
+            double lastMassFlow;     // kg/s into the pipe, last exchange
         };
 
         struct Junction {
@@ -112,7 +110,6 @@ class ExhaustNetwork {
 
     private:
         void applyBoundaries();
-        void applyPortFlux(Primary &prim);
         double gammaValue() const { return m_gamma; }
 
     private:

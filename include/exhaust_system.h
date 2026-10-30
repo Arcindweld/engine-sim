@@ -33,7 +33,7 @@ class ExhaustSystem : public Part {
             double megaphoneExitDiameter = 0.0;
             double tailpipeLength = 0.0;      // straight pipe after the cone (0 = none)
             double tailpipeDiameter = 0.0;    // default: the diameter it follows
-            double pipeCellSize = 0.02;       // m
+            double pipeCellSize = 0.04;       // m (see docs/exhaust-1d.md, performance)
             double wallTemperature = 700.0;   // K
         };
 
