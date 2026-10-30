@@ -1,4 +1,4 @@
-#include "..\include\connecting_rod.h"
+#include "../include/connecting_rod.h"
 #include "../include/connecting_rod.h"
 
 #include <cmath>

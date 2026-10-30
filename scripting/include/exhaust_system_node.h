@@ -36,6 +36,19 @@ namespace es_script {
             addInput("velocity_decay", &m_parameters.velocityDecay);
             addInput("impulse_response", &m_impulseResponse, InputTarget::Type::Object);
 
+            // 1-D gas-dynamics model (optional in scripts; defaults in objects.mr)
+            addInput("exhaust_model", &m_parameters.exhaustModel);
+            addInput("legacy_exhaust", &m_parameters.legacy);
+            addInput("primary_diameter", &m_parameters.primaryDiameter);
+            addInput("collector_diameter", &m_parameters.collectorDiameter);
+            addInput("collector_length", &m_parameters.collectorLength);
+            addInput("megaphone_length", &m_parameters.megaphoneLength);
+            addInput("megaphone_exit_diameter", &m_parameters.megaphoneExitDiameter);
+            addInput("tailpipe_length", &m_parameters.tailpipeLength);
+            addInput("tailpipe_diameter", &m_parameters.tailpipeDiameter);
+            addInput("pipe_cell_size", &m_parameters.pipeCellSize);
+            addInput("wall_temperature", &m_parameters.wallTemperature);
+
             ObjectReferenceNode<ExhaustSystemNode>::registerInputs();
         }
 

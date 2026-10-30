@@ -228,6 +228,11 @@ void PistonEngineSimulator::placeAndInitialize() {
 
     m_engine->getIgnitionModule()->reset();
 
+    // 1-D exhaust networks: every cylinder has registered its primary by now
+    for (int i = 0; i < m_engine->getExhaustSystemCount(); ++i) {
+        m_engine->getExhaustSystem(i)->buildNetwork();
+    }
+
     m_exhaustFlowStagingBuffer = new double[m_engine->getExhaustSystemCount()];
 }
 
@@ -317,6 +322,15 @@ void PistonEngineSimulator::simulateStep_() {
         }
     }
 
+    // 1-D exhaust pipes advance once per simulation step (CFL sub-stepped
+    // inside) with the port fluxes accumulated over the fluid sub-steps.
+    for (int j = 0; j < exhaustSystemCount; ++j) {
+        ExhaustSystem *exhaust = m_engine->getExhaustSystem(j);
+        if (!exhaust->isLegacy()) {
+            exhaust->processNetwork(timestep);
+        }
+    }
+
     im->resetIgnitionEvents();
 }
 
@@ -387,6 +401,11 @@ void PistonEngineSimulator::writeToSynthesizer() {
         ExhaustSystem *exhaust = head->getExhaustSystem(piston->getCylinderIndex());
         CombustionChamber *chamber = m_engine->getChamber(i);
 
+        if (!exhaust->isLegacy()) {
+            // 1-D model: the sound comes from the open end, see below
+            continue;
+        }
+
         const double exhaustLength =
             head->getHeaderPrimaryLength(piston->getCylinderIndex())
             + exhaust->getLength();
@@ -407,6 +426,19 @@ void PistonEngineSimulator::writeToSynthesizer() {
             head->getSoundAttenuation(piston->getCylinderIndex())
             * (exhaustSystem->getAudioVolume() * delayedExhaustPulse / cylinderCount)
             * (1 / (exhaustLength * exhaustLength));
+    }
+
+    // 1-D model: monopole source at the tailpipe exit.  The far-field
+    // pressure of an open pipe end is rho0 / (4 pi r) dQ/dt (Q = volume
+    // velocity); ExhaustNetwork::radiatedPressure() evaluates it at r = 1 m.
+    // SoundSourceGain brings it to the same order as the legacy per-cylinder
+    // signal (1600 Pa^-1 x runner gauge pressure x audio_volume / L^2) so the
+    // synthesizer's leveler, impulse responses and audio_volume keep working.
+    for (int i = 0; i < exhaustSystemCount; ++i) {
+        ExhaustSystem *exhaust = m_engine->getExhaustSystem(i);
+        if (exhaust->isLegacy()) continue;
+        m_exhaustFlowStagingBuffer[i] +=
+            attenuation_3 * exhaust->getAudioVolume() * SoundSourceGain * exhaust->getOutletSoundSource();
     }
 
     synthesizer().writeInput(m_exhaustFlowStagingBuffer);

@@ -59,6 +59,7 @@ add_library(engine-sim STATIC
     src/direct_throttle_linkage.cpp
     src/dynamometer.cpp
     src/engine.cpp
+    src/exhaust_network.cpp
     src/exhaust_system.cpp
     src/feedback_comb_filter.cpp
     src/filter.cpp
@@ -75,6 +76,7 @@ add_library(engine-sim STATIC
     src/low_pass_filter.cpp
     src/part.cpp
     src/piston.cpp
+    src/pipe_1d.cpp
     src/piston_engine_simulator.cpp
     src/simulator.cpp
     src/standard_valvetrain.cpp
@@ -103,6 +105,7 @@ add_library(engine-sim STATIC
     include/direct_throttle_linkage.h
     include/dynamometer.h
     include/engine.h
+    include/exhaust_network.h
     include/exhaust_system.h
     include/feedback_comb_filter.h
     include/filter.h
@@ -119,6 +122,7 @@ add_library(engine-sim STATIC
     include/low_pass_filter.h
     include/part.h
     include/piston.h
+    include/pipe_1d.h
     include/piston_engine_simulator.h
     include/simulator.h
     include/standard_valvetrain.h
@@ -310,6 +314,8 @@ add_executable(engine-sim-test
     test/gas_system_tests.cpp
     test/function_test.cpp
     test/synthesizer_tests.cpp
+    test/pipe_1d_tests.cpp
+    test/exhaust_network_tests.cpp
 )
 
 target_link_libraries(engine-sim-test
@@ -319,3 +325,22 @@ target_link_libraries(engine-sim-test
 
 include(GoogleTest)
 gtest_discover_tests(engine-sim-test)
+
+if (PIRANHA_ENABLED)
+    # Engine-level tests that compile the shipped scripts; they need the
+    # repository root for es/ and assets/.
+    add_executable(engine-sim-script-test
+        test/exhaust_engine_tests.cpp
+    )
+
+    target_compile_definitions(engine-sim-script-test
+        PRIVATE ENGINE_SIM_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+
+    target_link_libraries(engine-sim-script-test
+        gtest_main
+        engine-sim-script-interpreter
+        engine-sim
+    )
+
+    gtest_discover_tests(engine-sim-script-test)
+endif (PIRANHA_ENABLED)
