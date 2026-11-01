@@ -14,6 +14,9 @@ Synthesizer::Synthesizer() {
     m_inputBufferSize = 0;
     m_inputWriteOffset = 0.0;
     m_inputSamplesRead = 0;
+    // read by Simulator::startFrame before the audio side first sets it (renderAudio); left uninitialized, the first
+    // frame's step count came from whatever the heap held, so a run depended on what the process had done before
+    m_latency = 0;
 
     m_audioBufferSize = 0;
 
