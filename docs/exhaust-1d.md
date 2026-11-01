@@ -264,7 +264,7 @@ network from the legacy parameters. Two things to know when doing that:
 
 Linux, clang 18, headless build of the core library and the script
 interpreter (`test/` with gtest; the engine-level tests need
-`engine-sim-script-test`, which runs about 10 minutes). The Windows CI builds
+`engine-sim-script-test`, which runs about 5 minutes). The Windows CI builds
 `engine-sim-test` and runs the 1-D unit and network tests, and runs the test
 engine of `test/data` on the 1-D model through the headless runner.
 
@@ -307,6 +307,16 @@ Engine-level tests (`engine-sim-script-test`):
   pressures and the cumulative synthesizer input every 0.1 s with 17
   significant digits; the outputs are identical.
 * physics: see section 6.
+* Determinism: `Synthesizer::m_latency` was never initialized (upstream
+  code), and `Simulator::startFrame` reads it before the audio side first
+  sets it, so the first frame's step count came from whatever the heap held
+  and runs inside one process depended on what had run before them (the
+  primary-length test's torques moved by up to 2% between running it alone
+  and after (f), enough to fail its 4 cm / 2 cm agreement check). It is now
+  initialized; the engine-level tests give the same values alone and in the
+  suite, valgrind memcheck finds no uninitialized reads in a legacy or a 1-D
+  run, and fresh headless runs are unchanged (the test I4 at 6000 rpm:
+  141.205 N m on the 1-D model, 190.688 N m legacy, before and after).
 
 Pre-existing: upstream's own `GasSystemTests.PressureEquilibriumMaxFlow*`
 and `FunctionTests.FunctionGaussianTest` fail, and
