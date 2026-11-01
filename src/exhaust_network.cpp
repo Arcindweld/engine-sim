@@ -15,20 +15,40 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace {
     constexpr double Pi = 3.14159265358979323846;
     // Same role as the 0.9 clamp in GasSystem::flow for the port volume.
     constexpr double MaxForwardMoleFraction = 0.9;
+
+    // x^k for an integer k >= 0 (by squaring: x^7 takes four multiplications)
+    inline double ipow(double x, int k) {
+        double r = 1.0;
+        while (k > 0) {
+            if (k & 1) r *= x;
+            x *= x;
+            k >>= 1;
+        }
+        return r;
+    }
+
+    // x^(k/2) for an integer k >= 0
+    inline double halfPow(double x, int k) {
+        const double r = ipow(x, k / 2);
+        return (k & 1) ? r * std::sqrt(x) : r;
+    }
 }
 
 ExhaustNetwork::ExhaustNetwork() {
     m_built = false;
+    m_dof = 5;
     m_gamma = 1.4;
     m_R = 287.0;
     m_cp = m_gamma / (m_gamma - 1) * m_R;
     m_prc = std::pow(2 / (m_gamma + 1), m_gamma / (m_gamma - 1));
     m_psic = std::sqrt(m_gamma) * std::pow(2 / (m_gamma + 1), (m_gamma + 1) / (2 * (m_gamma - 1)));
+    m_tc = std::sqrt(2 / (m_gamma + 1));
     m_atmScalars[0] = m_atmScalars[1] = 0.0;
     m_outletMassFlow = 0.0;
     m_outletMassFlowDerivative = 0.0;
@@ -54,11 +74,13 @@ int ExhaustNetwork::addPrimary(const PrimarySpec &spec) {
 
 void ExhaustNetwork::build(const Parameters &params) {
     m_params = params;
-    m_gamma = 1.0 + 2.0 / params.degreesOfFreedom;
+    m_dof = std::max(1, params.degreesOfFreedom);
+    m_gamma = 1.0 + 2.0 / m_dof;
     m_R = constants::R / params.molarMass;
     m_cp = m_gamma / (m_gamma - 1) * m_R;
     m_prc = std::pow(2 / (m_gamma + 1), m_gamma / (m_gamma - 1));
     m_psic = std::sqrt(m_gamma) * std::pow(2 / (m_gamma + 1), (m_gamma + 1) / (2 * (m_gamma - 1)));
+    m_tc = std::sqrt(2 / (m_gamma + 1));
 
     // The legacy model treats the air outside the exhaust as inert (ExhaustSystem::process)
     m_atmScalars[0] = 0.0;   // fuel
@@ -147,10 +169,10 @@ double ExhaustNetwork::orificeFlow(double CdA, double p0, double T0, double pd) 
         psi = m_psic;
     }
     else {
-        // pr^(2/g) and pr^((g+1)/g) = pr^(2/g) * pr^((g-1)/g)
-        const double a = std::pow(pr, 2 / g);
-        const double b = a * std::pow(pr, g1 / g);
-        psi = std::sqrt(std::max(0.0, 2 * g / g1 * (a - b)));
+        // pr^(2/g) - pr^((g+1)/g) = pr^(2/g) (1 - t^2) with t = pr^((g-1)/(2g)), and pr^(2/g) = pr^2 / t^4
+        const double t = std::pow(pr, g1 / (2 * g));
+        const double t2 = t * t;
+        psi = std::sqrt(std::max(0.0, 2 * g / g1 * pr * pr / (t2 * t2) * (1 - t2)));
     }
     return CdA * std::sqrt(p0 * rho0) * psi;
 }
@@ -201,19 +223,28 @@ void ExhaustNetwork::portBoundary(Primary &prim, double dts) {
 // Face flux of a primary's inlet for a given state of its port volume (see portBoundary); `port` null or empty, or
 // no orifice: a closed end at the characteristic closed-end pressure. `guess` (a face pressure) starts the root
 // search.
+//
+// The unknown is s = (p_f / p_c)^((gamma - 1) / (2 gamma)), the face pressure measured from the first cell's p_c.
+// With gamma = 1 + 2 / dof the incoming characteristic gives u_f = J + dof c_c s, the cell's isentrope gives
+// p_f = p_c s^(dof + 2), rho_f = rho_c s^dof and T_f = T_c s^2, and the orifice ratio
+// t = (p_d / p_0)^((gamma - 1) / (2 gamma)) follows from s by products, with the orifice function
+// psi = t^dof sqrt(2 gamma / (gamma - 1) (1 - t^2)) (the textbook pr^(2/g) - pr^((g+1)/g) form rewritten). The root
+// search then needs no pow(): searching in p_f took about 15 pow() calls per face, a quarter of the run time of a
+// V8 on the 1-D model.
 void ExhaustNetwork::portFace(
     const Primary &prim, const GasSystem *port, double dts, double guess, double *F, double *facePressure) const
 {
     const Pipe1D &P = prim.pipe;
-    const double g = m_gamma, g1 = g - 1, k2 = 2 / g1, ex = g1 / (2 * g), ig = 1 / g;
+    const double g = m_gamma, g1 = g - 1, k2 = 2 / g1;
+    const int dof = m_dof, n = m_dof + 2;            // k2 = dof; p ~ s^n
     const double A = P.endFaceArea(-1);
     const double CdA = std::min(prim.spec.orificeArea, A);   // never wider than the pipe it feeds
 
     const double rc = P.density(0), uc = P.velocity(0), pc = P.pressure(0);
     const double cc = std::sqrt(g * pc / rc);
     const double J = uc - k2 * cc;                 // left-running invariant reaching the face from the pipe
-    const double cWall = -J / k2;                  // face sound speed (cell entropy) for u_f = 0
-    const double pWall = cWall > 0 ? pc * std::pow(cWall / cc, 1 / ex) : 0.0;
+    const double sWall = std::max(0.0, -J / (k2 * cc));     // face at rest (u_f = 0)
+    const double pWall = pc * ipow(sWall, n);
 
     for (int k = 0; k < Pipe1D::FluxCount; ++k) F[k] = 0.0;
     const bool open = port != nullptr && CdA > 0 && port->n() > 0 && port->temperature() > 0;
@@ -225,47 +256,10 @@ void ExhaustNetwork::portFace(
     }
     const double Tr = port->temperature();
     const double M = m_params.molarMass;
-
-    // h(pf) rises through zero between lo and hi. Secant steps from the guess (the last root), which is usually
-    // within a fraction of a percent of the answer: three evaluations; Illinois (modified regula falsi) on the
-    // bracket when a step leaves it or does not settle
+    const double sPort = std::pow(pr / pc, 1.0 / n);                       // the port pressure in s
+    const double sGuess = guess > 0 ? std::pow(guess / pc, 1.0 / n) : -1.0;
+    const double psiK = std::sqrt(2 * g / g1);
     const double tolFlow = 1e-10 * CdA * pr / std::sqrt(m_R * Tr);
-    auto solve = [&](auto &&h, double lo, double hi) {
-        if (guess > lo && guess < hi) {
-            double x0 = guess, h0 = h(x0);
-            if (std::fabs(h0) < tolFlow) return x0;
-            double x1 = x0 * (1 + 1e-6), h1 = h(x1);
-            for (int it = 0; it < 4; ++it) {
-                if (std::fabs(h1) < tolFlow) return x1;
-                if (h1 == h0) break;
-                const double x2 = x1 - h1 * (x1 - x0) / (h1 - h0);
-                if (!(x2 > lo && x2 < hi)) break;
-                x0 = x1; h0 = h1; x1 = x2; h1 = h(x1);
-            }
-        }
-        double hlo = h(lo), hhi = h(hi);
-        if (!(hlo < 0)) return lo;
-        if (!(hhi > 0)) return hi;
-        double x = 0.5 * (lo + hi);
-        int side = 0;
-        for (int it = 0; it < 60; ++it) {
-            x = (lo * hhi - hi * hlo) / (hhi - hlo);
-            if (!(x > lo && x < hi)) x = 0.5 * (lo + hi);
-            const double hx = h(x);
-            if (hx == 0 || hi - lo < 1e-11 * hi || std::fabs(hx) < tolFlow) return x;
-            if (hx < 0) {
-                lo = x; hlo = hx;
-                if (side == -1) hhi *= 0.5;
-                side = -1;
-            }
-            else {
-                hi = x; hhi = hx;
-                if (side == +1) hlo *= 0.5;
-                side = +1;
-            }
-        }
-        return x;
-    };
 
     double pf, uf, f, h0;
     double x[Pipe1D::ScalarCount];
@@ -274,14 +268,51 @@ void ExhaustNetwork::portFace(
         // energy (the port loses that share with its momentum, so the pipe has to receive it)
         h0 = m_cp * Tr + (port->mass() > 0 ? port->bulkKineticEnergy() / port->mass() : 0.0);
         const double uStar = std::sqrt(2 * g1 * h0 / (g + 1));   // sonic at the face
-        auto faceVelocity = [&](double p) { return std::min(uStar, J + k2 * cc * std::pow(p / pc, ex)); };
-        auto pipeFlow = [&](double p) {
-            const double u = faceVelocity(p);
-            return p / (m_R * (h0 - 0.5 * u * u) / m_cp) * u * A;
+        const double flowK = A * m_cp / m_R;                   // pipe flow = flowK p u / (h0 - u^2 / 2)
+        const double Q = CdA * pr / std::sqrt(m_R * Tr);        // CdA sqrt(p0 rho0) of the port gas
+        // h(s) = pipe flow - orifice flow and dh/ds. h rises from h(sWall) < 0 (gas at rest at the face, the
+        // orifice passing gas) to h(sPort) > 0 (no pressure drop left for the orifice)
+        struct Eval { double h, dh, p, u, flow; };
+        auto eval = [&](double s) {
+            Eval e;
+            e.p = pc * ipow(s, n);
+            double du = k2 * cc;
+            e.u = J + k2 * cc * s;
+            if (e.u > uStar) { e.u = uStar; du = 0.0; }
+            const double D = h0 - 0.5 * e.u * e.u;
+            e.flow = flowK * e.p * e.u / D;
+            const double dFlow = flowK / D * (n * e.p / s * e.u + e.p * du * (1 + e.u * e.u / D));
+            const double t = s / sPort;
+            double orifice = Q * m_psic, dOrifice = 0.0;
+            if (t > m_tc) {
+                const double one = std::max(0.0, 1 - t * t), sq = std::sqrt(one);
+                const double td = ipow(t, dof);
+                orifice = Q * psiK * td * sq;
+                // d/ds of Q psiK t^dof sqrt(1 - t^2), unbounded at t = 1 where the orifice flow vanishes
+                dOrifice = sq > 0 ? Q * psiK * td / t * (dof * one - t * t) / (sq * sPort)
+                                  : -std::numeric_limits<double>::infinity();
+            }
+            e.h = e.flow - orifice;
+            e.dh = dFlow - dOrifice;
+            return e;
         };
-        pf = solve([&](double p) { return pipeFlow(p) - orificeFlow(CdA, pr, Tr, p); }, pWall, pr);
-        uf = faceVelocity(pf);
-        f = pipeFlow(pf);
+        // Newton from the guess (the last root, usually within a fraction of a percent) inside the bracket
+        // [sWall, sPort], which every evaluation narrows; bisection when a step would leave it
+        double lo = sWall, hi = sPort;
+        double s = (sGuess > lo && sGuess < hi) ? sGuess : 0.5 * (lo + hi);
+        Eval e = eval(s);
+        for (int it = 0; it < 100; ++it) {
+            if (std::fabs(e.h) < tolFlow) break;
+            if (e.h < 0) lo = s; else hi = s;
+            if (!(hi - lo > 1e-14 * hi)) break;
+            double sn = s - e.h / e.dh;
+            if (!(sn > lo && sn < hi)) sn = 0.5 * (lo + hi);   // also a NaN or infinite step
+            s = sn;
+            e = eval(s);
+        }
+        pf = e.p;
+        uf = e.u;
+        f = e.flow;
         // at most 90% of the port's gas in one sub-step (as GasSystem::flow)
         f = std::min(f, MaxForwardMoleFraction * port->n() * M / dts);
         const GasSystem::Mix mix = port->mix();
@@ -289,27 +320,76 @@ void ExhaustNetwork::portFace(
         x[1] = mix.p_o2;
     }
     else {
-        // pipe -> port: pipe gas at the face, isentropic from the first cell
-        auto faceVelocity = [&](double p) {
-            const double c = cc * std::pow(p / pc, ex);
-            return std::max(-c, J + k2 * c);
+        // pipe -> port: pipe gas at the face, isentropic from the first cell, and the orifice from its stagnation
+        // state (p0 = p_f (T0 / T_f)^(n / 2)) to the port pressure. h(s) = orifice flow - flow out of the pipe rises
+        // through zero on [sPort, sWall]. Secant steps from the guess: three evaluations; Illinois (modified regula
+        // falsi) on the bracket when a step leaves it or does not settle
+        const double Tc = pc / (m_R * rc);
+        struct State { double p, u, T0, out, h; };
+        auto state = [&](double s) {
+            State st;
+            const double c = cc * s;
+            st.u = std::max(-c, J + k2 * c);
+            const double T = Tc * s * s;
+            st.p = pc * ipow(s, n);
+            st.T0 = T + 0.5 * st.u * st.u / m_cp;
+            const double theta = st.T0 / T;
+            const double p0 = st.p * halfPow(theta, n);
+            st.out = -rc * ipow(s, dof) * st.u * A;            // kg/s out of the pipe
+            const double t = sPort / (s * std::sqrt(theta));   // (pr / p0)^((gamma - 1) / (2 gamma))
+            double orifice = 0.0;
+            if (t < 1) {
+                const double psi = t <= m_tc ? m_psic : psiK * ipow(t, dof) * std::sqrt(1 - t * t);
+                orifice = CdA * p0 / std::sqrt(m_R * st.T0) * psi;
+            }
+            st.h = orifice - st.out;
+            return st;
         };
-        auto state = [&](double p, double *T0, double *p0) {
-            const double u = faceVelocity(p);
-            const double T = p / (m_R * rc * std::pow(p / pc, ig));
-            *T0 = T + 0.5 * u * u / m_cp;
-            *p0 = p * std::pow(*T0 / T, g / g1);
-            return -rc * std::pow(p / pc, ig) * u * A;      // kg/s out of the pipe
-        };
-        pf = solve([&](double p) {
-            double T0, p0;
-            const double out = state(p, &T0, &p0);
-            return orificeFlow(CdA, p0, T0, pr) - out;
-        }, pr, pWall);
-        double T0, p0;
-        f = -state(pf, &T0, &p0);
-        uf = faceVelocity(pf);
-        h0 = m_cp * T0;
+        auto h = [&](double s) { return state(s).h; };
+        double lo = sPort, hi = sWall, s = -1.0;
+        if (sGuess > lo && sGuess < hi) {
+            double x0 = sGuess, h0s = h(x0);
+            if (std::fabs(h0s) < tolFlow) s = x0;
+            else {
+                double x1 = x0 * (1 + 1e-6), h1 = h(x1);
+                for (int it = 0; it < 4; ++it) {
+                    if (std::fabs(h1) < tolFlow) { s = x1; break; }
+                    if (h1 == h0s) break;
+                    const double x2 = x1 - h1 * (x1 - x0) / (h1 - h0s);
+                    if (!(x2 > lo && x2 < hi)) break;
+                    x0 = x1; h0s = h1; x1 = x2; h1 = h(x1);
+                }
+            }
+        }
+        if (s < 0) {
+            double hlo = h(lo), hhi = h(hi);
+            if (!(hlo < 0)) s = lo;
+            else if (!(hhi > 0)) s = hi;
+            else {
+                int side = 0;
+                for (int it = 0; it < 60; ++it) {
+                    s = (lo * hhi - hi * hlo) / (hhi - hlo);
+                    if (!(s > lo && s < hi)) s = 0.5 * (lo + hi);
+                    const double hs = h(s);
+                    if (hs == 0 || hi - lo < 1e-11 * hi || std::fabs(hs) < tolFlow) break;
+                    if (hs < 0) {
+                        lo = s; hlo = hs;
+                        if (side == -1) hhi *= 0.5;
+                        side = -1;
+                    }
+                    else {
+                        hi = s; hhi = hs;
+                        if (side == +1) hlo *= 0.5;
+                        side = +1;
+                    }
+                }
+            }
+        }
+        const State st = state(s);
+        pf = st.p;
+        uf = st.u;
+        f = -st.out;
+        h0 = m_cp * st.T0;
         for (int k = 0; k < Pipe1D::ScalarCount; ++k) x[k] = P.scalar(0, k);
     }
 
@@ -401,12 +481,18 @@ void ExhaustNetwork::junctionN(JunctionEnd *ends, int count, Junction &jn) const
 
     // mass flow into the junction from end k at junction pressure ps, and its
     // derivative: s = ps / p_k, c = c_k s^ex, rho = rho_k s^ig = rho_k (s^ex)^k2,
-    // d(rho u)/dps = rho (ig u -/+ k2 ex c) / ps
+    // d(rho u)/dps = rho (ig u -/+ k2 ex c) / ps. With gamma = 1 + 2 / dof, k2 = dof
+    // is an integer, and s^ex = exp(ex (ln ps - ln p_k)) takes one exp() per end
+    // and one log() per pressure instead of two pow() per end.
+    double logP[32];
+    for (int k = 0; k < count; ++k) logP[k] = std::log(E[k].p);
+    double lastPs = -1.0, lastLog = 0.0;
     auto inflow = [&](int k, double ps, double *derivative) {
         const int side = ends[k].side;
-        const double se = std::pow(ps / E[k].p, ex);
+        if (ps != lastPs) { lastPs = ps; lastLog = std::log(ps); }
+        const double se = std::exp(ex * (lastLog - logP[k]));
         const double c = E[k].c * se;
-        const double r = E[k].r * std::pow(se, k2);
+        const double r = E[k].r * ipow(se, m_dof);
         const double u = side > 0 ? E[k].J - k2 * c : E[k].J + k2 * c;
         E[k].cs = c; E[k].us = u; E[k].rs = r;
         if (derivative) {

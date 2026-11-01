@@ -136,7 +136,11 @@ class ExhaustNetwork {
         bool m_built;
 
         double m_gamma, m_R, m_cp;
+        // gamma = 1 + 2 / dof: with s = (p / p_ref)^((gamma - 1) / (2 gamma)), p = p_ref s^(dof + 2) and
+        // rho = rho_ref s^dof, so the port boundary needs integer powers of s instead of pow()
+        int m_dof;
         double m_prc, m_psic;       // critical pressure ratio and choked flow function
+        double m_tc;                // (critical pressure ratio)^((gamma - 1) / (2 gamma)) = sqrt(2 / (gamma + 1))
         double m_atmScalars[Pipe1D::ScalarCount];
 
         double m_outletMassFlow;
