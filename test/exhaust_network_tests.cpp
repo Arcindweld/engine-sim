@@ -118,8 +118,8 @@ ExchangeBalance portBlowdown(GasSystem &port) {
 // the network advances (its port boundaries move gas between the ports and the pipes); once per simulation step
 // the step is closed. Returns the mean and RMS port gauge pressure and the forward flow per cycle over the last
 // 10 of 20 cycles at 6000 rpm, the share of it that came back, and how often the port flow changed direction.
-struct CoupledRun { double portMean, portRms, forwardPerCycle, backflowShare, reversalsPerCycle; };
-CoupledRun runCoupled(double cellSize, double simulationFrequency) {
+struct CoupledRun { double portMean, portRms, forwardPerCycle, backflowShare, reversalsPerCycle, pipeSteps; };
+CoupledRun runCoupled(double cellSize, double simulationFrequency, bool holdPipes = true) {
     PulsedPorts ports;
     ExhaustNetwork net;
     ExhaustNetwork::PrimarySpec spec;
@@ -132,6 +132,7 @@ CoupledRun runCoupled(double cellSize, double simulationFrequency) {
     }
     ExhaustNetwork::Parameters np = fourIntoOne();
     np.cellSize = cellSize;
+    np.holdPipes = holdPipes;
     net.build(np);
 
     const int fluidSteps = 8;
@@ -139,6 +140,7 @@ CoupledRun runCoupled(double cellSize, double simulationFrequency) {
     const double period = 0.02, tAverage = 0.2, tEnd = 0.4;
     double t = 0, pSum = 0, p2Sum = 0, tSum = 0, forward = 0, back = 0, lastSign = 0;
     long reversals = 0;
+    double pipeSteps = 0, stepCount = 0;
     while (t < tEnd - 1e-12) {
         for (int s = 0; s < fluidSteps; ++s) {
             ports.drive(t + s * dtFluid, dtFluid, true);
@@ -160,6 +162,7 @@ CoupledRun runCoupled(double cellSize, double simulationFrequency) {
             }
         }
         net.finishStep();
+        if (t >= tAverage) { pipeSteps += net.lastSubSteps(); ++stepCount; }
         t += dt;
     }
     const double cycles = (tEnd - tAverage) / period;
@@ -169,6 +172,7 @@ CoupledRun runCoupled(double cellSize, double simulationFrequency) {
     r.forwardPerCycle = forward / cycles;
     r.backflowShare = back / std::max(forward, 1e-30);
     r.reversalsPerCycle = reversals / cycles;
+    r.pipeSteps = pipeSteps / std::max(stepCount, 1.0);
     return r;
 }
 
@@ -328,4 +332,36 @@ TEST(ExhaustNetworkTests, CoupledPortsConvergeWithCellSizeAndFrequency) {
     EXPECT_TRUE(converging(run[0].forwardPerCycle, run[1].forwardPerCycle, ref.forwardPerCycle));
     EXPECT_TRUE(converging(run[0].backflowShare, run[1].backflowShare, ref.backflowShare));
     EXPECT_NEAR(run[1].portRms, ref.portRms, 0.15 * ref.portRms);
+}
+
+// Multi-rate stepping (Parameters::holdPipes): the pipes at their own CFL step while the ports keep the fluid
+// sub-step against the pipes' held state, against lock-step (the pipes advanced with every sub-step) on the coupled
+// ports at 20 kHz. On 4 and 2 cm cells lock-step runs the pipes at a small fraction of their CFL step, where the
+// upwind scheme is most diffusive; held, they run near their CFL step and come out closer to the 1 cm result. On
+// 1 cm cells at 40 kHz, where both resolve the waves, the two agree.
+TEST(ExhaustNetworkTests, HeldPipesConvergeToTheFineGrid) {
+    const CoupledRun ref = runCoupled(0.01, 20000, false);   // CFL-limited: lock-step either way
+    for (double cell : { 0.04, 0.02 }) {
+        const CoupledRun held = runCoupled(cell, 20000, true), lock = runCoupled(cell, 20000, false);
+        std::cout << "[  values  ] " << 100 * cell << " cm 20 kHz, held / lock-step / 1 cm: rms " << held.portRms
+                  << " / " << lock.portRms << " / " << ref.portRms << " Pa, forward " << 1e6 * held.forwardPerCycle
+                  << " / " << 1e6 * lock.forwardPerCycle << " / " << 1e6 * ref.forwardPerCycle
+                  << " mg/cycle, back-flow " << 100 * held.backflowShare << " / " << 100 * lock.backflowShare << " / "
+                  << 100 * ref.backflowShare << " %, pipe steps per step " << held.pipeSteps << " / "
+                  << lock.pipeSteps << "\n";
+        EXPECT_LT(held.pipeSteps, 0.5 * lock.pipeSteps);   // the point of it
+        EXPECT_LT(std::fabs(held.portRms - ref.portRms), std::fabs(lock.portRms - ref.portRms));
+        EXPECT_LT(std::fabs(held.forwardPerCycle - ref.forwardPerCycle),
+                  std::fabs(lock.forwardPerCycle - ref.forwardPerCycle));
+        EXPECT_LT(std::fabs(held.backflowShare - ref.backflowShare),
+                  std::fabs(lock.backflowShare - ref.backflowShare));
+    }
+    const CoupledRun held = runCoupled(0.01, 40000, true), lock = runCoupled(0.01, 40000, false);
+    std::cout << "[  values  ] 1 cm 40 kHz, held / lock-step: rms " << held.portRms << " / " << lock.portRms
+              << " Pa, forward " << 1e6 * held.forwardPerCycle << " / " << 1e6 * lock.forwardPerCycle
+              << " mg/cycle, pipe steps per step " << held.pipeSteps << " / " << lock.pipeSteps << "\n";
+    EXPECT_LT(held.pipeSteps, 0.5 * lock.pipeSteps);
+    EXPECT_NEAR(held.portRms, lock.portRms, 0.01 * lock.portRms);
+    EXPECT_NEAR(held.forwardPerCycle, lock.forwardPerCycle, 0.01 * lock.forwardPerCycle);
+    EXPECT_NEAR(held.backflowShare, lock.backflowShare, 0.01);
 }
