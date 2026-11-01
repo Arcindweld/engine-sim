@@ -104,7 +104,10 @@ the receiving side of junctions) and 2.4 (port coupling).
   `TemperatureFrontCrossesJunctionsUndisturbed`.) Newton with an analytic
   derivative with the ends' own densities starts the secant solve of the
   mass balance with the mixed state (bisection fallback); the receiving ends
-  are then scaled to the inflow so the fluxes sum to zero to round-off.
+  are then scaled to the inflow so the fluxes sum to zero to round-off. Each
+  evaluation takes one `log` of the junction pressure and one `exp` per end
+  (`(p_j / p_k)^((gamma - 1) / (2 gamma))`), the density ratio being that to
+  the integer power `dof`.
 * **Step** between two collector pipes of different diameter: the two-pipe
   version of the same (reference `junction`). Cones are not steps: a linear
   diameter taper stays inside one pipe through `A(x)`.
@@ -149,8 +152,18 @@ Internal-Combustion Engines*, vol. 1, Oxford 1982; Winterbone & Pearson,
     pressure, and an outflow is capped at sonic.
 
   The root is bracketed between the closed-end pressure and the port
-  pressure; secant steps from the previous sub-step's answer find it, with
-  the Illinois method on the bracket as the fallback. For a full-area opening
+  pressure. The unknown is `s = (p_f / p_c)^((gamma - 1) / (2 gamma))`: with
+  `gamma = 1 + 2 / dof` (the gas model's degrees of freedom), `u_f = J + dof
+  c_c s`, the first cell's isentrope gives `p_f = p_c s^(dof + 2)`, `rho_f =
+  rho_c s^dof` and `T_f = T_c s^2`, and the orifice function becomes `psi =
+  t^dof sqrt(2 gamma / (gamma - 1) (1 - t^2))` with `t = (p_d / p_0)^((gamma -
+  1) / (2 gamma))`, a product of `s` and constants. The search needs no
+  `pow` (two per face to set it up): port -> pipe by Newton with the analytic
+  derivative, started from the previous sub-step's root and kept inside the
+  bracket; pipe -> port by secant steps from that root, with the Illinois
+  method on the bracket as the fallback. Searching in `p_f` instead took
+  about 15 `pow` calls per face; with two faces per port per sub-step that
+  was a quarter of the run time of a V8 (section 5). For a full-area opening
   the boundary reduces to the usual isentropic inflow from a plenum and, for
   outflow, to a face at the port pressure.
 * The face flux (mass, momentum with `p_f A`, stagnation enthalpy, species)
@@ -269,7 +282,7 @@ Unit and network tests (`engine-sim-test`):
 | (i) temperature front (900 K gas behind 300 K gas, same p and u = 50 m/s) through junctions | two-pipe step, two-ended and three-ended junction, both flow directions: pressure stays within 1e-4 Pa and velocity within 1e-6 m/s of uniform (the receiving-end density of the first version gave 6.5-10 kPa and 23-45 m/s) |
 | port boundary, energy | mass and total energy (port internal + bulk kinetic, pipes) to 1e-16 relative over 1.5 ms: port at rest and moving at 38 / 20 m/s, emptying (3 atm to 1 atm) and filling (0.5 atm to 1 atm) |
 | port boundary, steady flow | a port held at 1.3 bar, 900 K into a frictionless pipe open at its end: 0.0593928 kg/s through the boundary and 0.0593931 kg/s out of the pipe vs the orifice formula's 0.0593936 kg/s |
-| coupled ports: 4 ports with a valve-like feed into a 4-1, driven like the engine | the port flow changes direction 19-32 times per cycle (the waves; with the cell-source exchange it reversed on 90% of the 3200 sub-steps per cycle). RMS port gauge pressure on 1 cm cells at 10 / 20 / 40 kHz: 6977 / 6977 / 6991 Pa (7135 / 7016 / 6997 with one explicit port step instead of the midpoint rule); at 20 kHz on 4 / 2 / 1 / 0.5 cm cells: 5402 / 6422 / 6977 / 7030 Pa (the port's own ring near c A / (2 pi V), 2 kHz here, is above what 4 cm cells carry) |
+| coupled ports: 4 ports with a valve-like feed into a 4-1, driven like the engine | the port flow changes direction 18-28 times per cycle (the waves; with the cell-source exchange it reversed on 90% of the 3200 sub-steps per cycle). RMS port gauge pressure on 1 cm cells at 10 / 20 / 40 kHz: 6977 / 6977 / 6991 Pa (7135 / 7016 / 6997 with one explicit port step instead of the midpoint rule); at 20 kHz on 4 / 2 / 1 / 0.5 cm cells: 5402 / 6422 / 6977 / 7030 Pa (the port's own ring near c A / (2 pi V), 2 kHz here, is above what 4 cm cells carry) |
 
 Engine-level tests (`engine-sim-script-test`):
 
@@ -308,50 +321,59 @@ this branch.
 Test machine: 2-core Xeon at 2.8 GHz, shared with other jobs (CPU time of
 the process is reported; wall time was 2-3x higher under load). Dyno hold,
 4 s with 2 s settling, no audio, each engine at its own
-`simulation_frequency`:
+`simulation_frequency`; "before" is the same build without the `pow`-free
+port face search of section 2.4, run in the same session:
 
-| engine | sim. frequency | model | cells | CPU s per simulated s | relative | torque, N m |
+| engine | sim. frequency | model | cells | CPU s per simulated s (before) | relative to legacy | torque, N m (before) |
 |---|---|---|---|---|---|---|
-| GM LS V8 (two 4-1), 4000 rpm | 10 kHz | legacy | - | 0.71 | 1.0 | 714.0 |
-| GM LS V8 (two 4-1), 4000 rpm | 10 kHz | 1-D, 4 cm | 340 | 4.14 | 5.8 | 719.8 |
-| GM LS V8 (two 4-1), 4000 rpm | 10 kHz | 1-D, 3 cm | 456 | 4.73 | 6.7 | 719.3 |
-| GM LS V8 (two 4-1), 4000 rpm | 10 kHz | 1-D, 2 cm | 663 | 6.23 | 8.8 | 718.7 |
-| Subaru EJ25 (two systems), 3500 rpm | 20 kHz | legacy | - | 0.76 | 1.0 | 207.1 |
-| Subaru EJ25 (two systems), 3500 rpm | 20 kHz | 1-D, 4 cm | 424 | 6.99 | 9.2 | 199.6 |
-| Lexus LFA V10, 5000 rpm | 6.5 kHz | legacy | - | 0.69 | 1.0 | 197.5 |
-| Lexus LFA V10, 5000 rpm | 6.5 kHz | 1-D, 4 cm | 454 | 3.44 | 5.0 | 150.6 |
+| GM LS V8 (two 4-1), 4000 rpm | 10 kHz | legacy | - | 0.78 | 1.0 | 714.0 |
+| GM LS V8 (two 4-1), 4000 rpm | 10 kHz | 1-D, 4 cm | 340 | 2.92 (3.77) | 3.7 (4.8) | 719.8 (719.8) |
+| GM LS V8 (two 4-1), 4000 rpm | 10 kHz | 1-D, 2 cm | 663 | 4.63 (5.89) | 5.9 (7.6) | 718.7 (718.7) |
+| Subaru EJ25 (two systems), 3500 rpm | 20 kHz | legacy | - | 0.70 | 1.0 | 207.1 |
+| Subaru EJ25 (two systems), 3500 rpm | 20 kHz | 1-D, 4 cm | 424 | 5.08 (6.25) | 7.3 (8.9) | 199.7 (199.6) |
+| Lexus LFA V10, 5000 rpm | 6.5 kHz | legacy | - | 0.68 | 1.0 | 197.5 |
+| Lexus LFA V10, 5000 rpm | 6.5 kHz | 1-D, 4 cm | 454 | 2.44 (3.19) | 3.6 (4.7) | 153.1 (150.6) |
+| test inline-4, 6000 rpm | 20 kHz | legacy | - | 0.72-0.75 | 1.0 | 190.7 |
+| test inline-4, 6000 rpm | 20 kHz | 1-D, 4 cm | 84 | 2.05 (3.48) | 2.8 (4.7) | 141.2 (141.2) |
+| test inline-4, 6000 rpm | 20 kHz | 1-D, 2 cm | 168 | 2.77 (4.21) | 3.8 (5.7) | 138.5 (138.5) |
+| test inline-4, 6000 rpm | 20 kHz | 1-D, 1 cm | 337 | 5.65 (7.56) | 7.7 (10.3) | 137.5 (137.5) |
 
-(The LFA's 6.5 kHz is 4.6 degrees of crank per step at 5000 rpm; neither
-model is converged there, section 6.) The test inline-4 of section 6 at
-20 kHz: legacy 0.5-0.8 CPU s per simulated second, 1-D 3.6-3.9 on 4 cm cells,
-4.3-4.5 on 2 cm, 9.1 on 1 cm, 21 on 0.5 cm.
+The new search finds the same roots to the same tolerance: the test
+inline-4 gives the same torque to six digits at every point checked (4000,
+5000 and 6000 rpm, 4 / 2 / 1 cm), as does the LS; the EJ25 moved by 0.05%
+and the LFA by 1.7% (at 6.5 kHz, 4.6 degrees of crank per step, where
+neither model is converged, section 6, and differences at round-off level
+grow over a run). The unit tests give the same values to every printed
+digit. The cost fell by 19-41%, most where the ports are a large share of
+the network (the inline-4's 84 cells feed four ports).
 
 The network advances after every one of the engine's 8 fluid sub-steps
 (section 2.4), so with 4 cm cells it takes 8 pipe steps per simulation step
-where its CFL step would allow 1-3; finer cells cost more only once their
-CFL step is shorter than the fluid sub-step (about 1 cm at 20 kHz, 3 cm at
-10 kHz). Each pipe step solves every port boundary twice (the midpoint rule)
-and the junctions once. The earlier, loosely coupled scheme cost about half
-as much (1.85 CPU s for the LS at 10 kHz with 4 cm cells) but did not
-converge. Per cell update the solver costs about 65 ns in isolation and
-80 ns inside the engine. Bandwidth: the shortest wavelength carried cleanly
-is about 8-10 cells, so 4 cm resolves up to ~1-1.5 kHz in hot gas (c ~
-600-800 m/s) and 2 cm up to ~2-3 kHz; the firing harmonics of every shipped
-engine are inside the 4 cm range, the hiss and crack above 2 kHz are left
-to the impulse response.
+where its CFL step would allow about 3 at 20 kHz and about 5 at 10 kHz (the
+CFL-limited counts measured on finer cells, 10.8 per step on 1 cm at 20 kHz
+and 9.3 on 2 cm at 10 kHz, scaled with the cell size);
+finer cells cost more only once their CFL step is shorter than the fluid
+sub-step (between 1 and 2 cm at 20 kHz, 2 and 3 cm at 10 kHz). Each pipe
+step solves every port boundary twice (the midpoint rule) and the junctions
+once. The earlier, loosely coupled scheme cost 1.85 CPU s for the LS at
+10 kHz with 4 cm cells but did not converge. Bandwidth: the shortest
+wavelength carried cleanly is about 8-10 cells, so 4 cm resolves up to
+~1-1.5 kHz in hot gas (c ~ 600-800 m/s) and 2 cm up to ~2-3 kHz; the firing
+harmonics of every shipped engine are inside the 4 cm range, the hiss and
+crack above 2 kHz are left to the impulse response.
 
 Kept: one half-step predictor per cell (not per face), no divisions in the
-hot loop, analytic Newton derivatives and one `pow` per branch in the
-junctions, cached orifice constants, the port face solve started with
-secant steps from the last root. Not done yet: advancing the pipe
-interiors at their own CFL step while the port boundaries keep the fluid
-sub-step against a first cell held for up to one CFL step (the incoming
-characteristic held, as the method of characteristics does over a step,
-with the face fluxes accumulated); it would cut the 4 cm cost by roughly the
-factor between the two steps and needs the convergence checks of section 6
-repeated. Also not done: single precision, SIMD across cells, one exhaust
-system per thread. On a slow machine use `legacy_exhaust: true`; coarser
-cells than 4 cm save little now.
+hot loop, no `pow` in the port face search (section 2.4), one `log` per
+pressure and one `exp` per end in the junctions, cached orifice constants.
+Not done yet: advancing the pipe interiors at their own CFL step while the
+port boundaries keep the fluid sub-step against a first cell held for up to
+one CFL step (the incoming characteristic held, as the method of
+characteristics does over a step, with the face fluxes accumulated). It
+would cut the pipe-interior work on 4 cm cells by the ratio of the two
+counts above and needs the convergence checks of section 6 repeated. Also
+not done: single precision, SIMD across cells, one exhaust system per
+thread. On a slow machine use `legacy_exhaust: true`; coarser cells than
+4 cm save little now.
 
 ## 6. Physics check: primary length
 
