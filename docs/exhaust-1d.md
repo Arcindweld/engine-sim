@@ -72,27 +72,39 @@ equations, then an HLLC Riemann flux (Toro ch. 10.4-10.5) at every face,
 and a conservative update with the sources. Passive scalars travel with the
 mass flux of the side that holds the contact wave. Density is floored at
 1e-6 of its reference. CFL number 0.8 on `|u| + c` over all cells of a
-network; the network sub-steps inside each simulation step as often as
-needed, so any `simulation_frequency` works (for the shipped engines, 1 to 6
-sub-steps at 4 cm cells).
+network. The network advances after every fluid sub-step of the engine (8 per
+simulation step) and sub-steps further inside when its CFL step is shorter;
+with 4 cm cells the fluid sub-step (6 us at 20 kHz) is the shorter one, from
+about 1 cm down the CFL step is.
 
 The scheme, the junction solvers and the engine coupling are a port of the
 validated JavaScript reference (`wsFactory()` in the ExhaustTuner
 calculator: Sod shock tube within 0.4%, linear-acoustic split at a step
-within 0.3%). Two things were changed on purpose, see 2.3 (open end) and 2.4
-(port coupling).
+within 0.3%; this C++ solver is checked against the exact Riemann solution
+itself, section 4). Three things were changed on purpose, see 2.3 (open end,
+the receiving side of junctions) and 2.4 (port coupling).
 
 ### 2.3 Boundaries
 
-* **Port end** of a primary: the first cell receives (or gives up) the mass
-  exchanged with the cylinder's port volume as a cell source; the face itself
-  is a wall (section 2.4).
+* **Port end** of a primary: a valve-type characteristic boundary between
+  the cylinder's port volume and the pipe's inlet face, solved every pipe
+  sub-step (section 2.4).
 * **N-way junction** (primaries into the collector): method of
   characteristics, one pressure for all ends, the isentropic change of state
-  along each incoming Riemann invariant, mass flows that sum to zero (Newton
-  with analytic derivative, bisection fallback), inflows mixed by mass before
-  they are sent down the branches that receive gas (reference `junctionN`,
-  Blair's constant-pressure junction).
+  along each incoming Riemann invariant, mass flows that sum to zero, inflows
+  mixed by mass before they are sent down the branches that receive gas
+  (reference `junctionN`, Blair's constant-pressure junction). A receiving
+  end takes the mixed inflow's state at the face, as the open end takes the
+  outside air: velocity from the pipe's own characteristic at the junction
+  pressure, temperature from the mixed stagnation enthalpy, density `p / (R
+  T)`. (The reference, and the first version here, gave it the receiving
+  pipe's own density; the mass flux then disagreed with the energy flux and
+  every temperature front put a pressure step at the junction, 6.5-10 kPa for
+  900 K gas meeting 300 K gas at 50 m/s, test
+  `TemperatureFrontCrossesJunctionsUndisturbed`.) Newton with an analytic
+  derivative with the ends' own densities starts the secant solve of the
+  mass balance with the mixed state (bisection fallback); the receiving ends
+  are then scaled to the inflow so the fluxes sum to zero to round-off.
 * **Step** between two collector pipes of different diameter: the two-pipe
   version of the same (reference `junction`). Cones are not steps: a linear
   diameter taper stays inside one pipe through `A(x)`.
@@ -113,35 +125,77 @@ within 0.3%). Two things were changed on purpose, see 2.3 (open end) and 2.4
 ### 2.4 Coupling to the cylinder
 
 The cylinder side keeps its lumped exhaust-port `GasSystem`, now holding only
-the head's `exhaust_runner_volume` (floored at one cell's volume), and the
-existing cylinder -> port valve flow is untouched. In place of the legacy
-port -> collector orifice, each fluid sub-step calls
-`ExhaustSystem::exchangePort()`:
+the head's `exhaust_runner_volume` (floored at 2 cm of the runner's
+cross-section), and the existing cylinder -> port valve flow is untouched. In
+place of the legacy port -> collector orifice, the port volume feeds its
+primary through a boundary condition at the primary's inlet face
+(`ExhaustNetwork::portBoundary`), the valve boundary of the method of
+characteristics (Benson, *The Thermodynamics and Gas Dynamics of
+Internal-Combustion Engines*, vol. 1, Oxford 1982; Winterbone & Pearson,
+*Theory of Engine Manifold Design*, 2000):
 
-* compressible orifice flow between the port (stagnation `p`, `T`) and the
-  pipe's first cell (stagnation state from its `p`, `T`, `u`), in the
-  direction of the higher stagnation pressure (reference `valveFlow`), with
-  effective area `Cd A = min(k sqrt(M_air), A_port, A_pipe)`. The identity
+* Before every pipe sub-step it finds the face pressure `p_f` at which the
+  compressible orifice flow between the port and the face equals the flow
+  the pipe takes along its incoming characteristic, `u_f = J + 2 c_f /
+  (gamma - 1)` with `J = u - 2 c / (gamma - 1)` of the first cell and `c_f`
+  isentropic from it:
+  * port -> pipe (port pressure above the face's closed-end pressure): the
+    gas at the face is port gas, `T_f = (h0_port - u_f^2/2) / cp`, `rho_f =
+    p_f / (R T_f)` (the contact between port gas and pipe gas sits at the
+    face, as at the open end), the orifice runs from the port's `p`, `T` to
+    `p_f`, and `u_f` is capped at sonic;
+  * pipe -> port: the gas at the face is pipe gas, isentropic from the first
+    cell to `p_f`; the orifice runs from its stagnation state to the port
+    pressure, and an outflow is capped at sonic.
+
+  The root is bracketed between the closed-end pressure and the port
+  pressure; secant steps from the previous sub-step's answer find it, with
+  the Illinois method on the bracket as the fallback. For a full-area opening
+  the boundary reduces to the usual isentropic inflow from a plenum and, for
+  outflow, to a face at the port pressure.
+* The face flux (mass, momentum with `p_f A`, stagnation enthalpy, species)
+  goes to the pipe, and the port volume gives up or takes the same mass,
+  total energy and species over the sub-step. Gas leaving the port takes its
+  internal energy, the flow work `R T` per mole and its share of the port's
+  bulk kinetic energy (the port's momentum is scaled with the gas that
+  leaves, as `GasSystem::flow` does); gas entering it brings its stagnation
+  enthalpy, and the bulk motion it slows becomes heat. Mass and total energy
+  are conserved to round-off (test `PortExchangeConservesEnergy`, with the
+  port at rest and moving, emptying and filling).
+* The port volume is integrated with the explicit midpoint rule: the flux is
+  taken from the port's state half a sub-step on. One explicit step made the
+  port relax about 7% too fast at 20 kHz, a first-order error that left the
+  torque drifting with the frequency (134.1 / 135.3 / 140.6 N m at 15 / 20 /
+  40 kHz on 2 cm cells for the test I4 at 6000 rpm; 137.8 / 138.5 / 139.5
+  with the midpoint rule).
+* Effective area `Cd A = min(k sqrt(M_air), A_port, A_pipe)`. The identity
   `Cd A = k sqrt(M)` comes from `GasSystem::flowRate` (`n_dot = k p0
   sqrt(gamma/(R T0)) f(pr)`) against the physical orifice (`m_dot = Cd A p0
   sqrt(gamma M/(R T0)) f(pr)`), so `primary_flow_rate` keeps its meaning.
-* gas leaving the port takes its internal energy plus the flow work `R T`
-  per mole (the port loses enthalpy); the pipe cell receives the enthalpy and
-  the jet momentum `m u_jet` with `u_jet` the isentropic velocity from the
-  port's stagnation state to the cell pressure (capped at sonic). Gas
-  entering the port brings its stagnation enthalpy. Total energy and mass
-  are therefore conserved exactly (test `PortExchangeConservesEnergy`).
-* clamps: at most 90% of the port's moles per sub-step (as
-  `GasSystem::flow`) and at most 20% of the cell's mass per sub-step in the
-  reverse direction.
+  At most 90% of the port's moles leave in one sub-step (as `GasSystem::flow`).
+* Timing: the network advances after every fluid sub-step of the engine
+  (8 x `simulation_frequency`), right after the cylinders have flowed into
+  their ports, with its own CFL sub-steps inside; the outlet flow (the sound
+  source) is closed once per simulation step.
 
-Both sides are updated at once at the fluid sub-step rate (8 x
-`simulation_frequency`), and the pipes advance once per simulation step.
-The first version averaged the port flux over a step and fed it to the pipe
-as a face flux; with a 50 cc port against a 40-60 cc first cell that
-explicit coupling oscillated and could empty the first cell. Updating the
-cell directly each sub-step (as the reference does for its chambers) is
-stable at all tested cell sizes and simulation frequencies.
+For a small pressure difference the flow is then limited by the pipe's wave
+impedance, `m ~ A dp / c`, and the port relaxes on `V / (c A)`, about
+0.05 ms for a 50 cc port on a 44 mm primary, against a sub-step of 6 us at
+20 kHz. Two earlier forms did not converge:
+
+1. Averaging the port flux over a simulation step and feeding it to the pipe
+   as a face flux: unstable with a 50 cc port against a 40-60 cc first cell.
+2. The orifice flow computed from the first cell's own state at every fluid
+   sub-step and added to the cell as a source, with the pipes advanced once
+   per simulation step. An explicit square-root orifice law between two small
+   volumes overshoots: its slope is unbounded at zero pressure difference, so
+   the exchange settles into a two-step oscillation of about `rho (Cd A dt c^2
+   (1/V_port + 1/V_cell))^2 / 2` (kPa at 20 kHz) and the flow reversed on
+   nearly every sub-step; with the pipes frozen through eight exchanges the
+   I4 at 6000 rpm made 148.7 / 183.6 / 118.5 / -6.7 N m on 4 / 2 / 1 / 0.5 cm
+   cells. Advancing the pipes after every exchange removed the freezing but
+   not the oscillation (131.8 / 134.5 / 141.1 / 143.4 N m). Section 6 has the
+   numbers with the boundary form.
 
 ### 2.5 Sound
 
@@ -175,8 +229,10 @@ network built from their legacy parameters.
 | `wall_temperature` | 700 K | wall temperature for the heat-transfer source |
 
 Per-cylinder primary length = `primary_tube_length` + that cylinder's
-`primary_length` (both existed before). `outlet_flow_rate` and
-`velocity_decay` are legacy-only.
+`primary_length` (both existed before). `outlet_flow_rate` is legacy-only.
+`velocity_decay` acts in both models: besides the legacy collector volume it
+sets how fast the bulk flow of each cylinder's exhaust-port volume decays
+(`CombustionChamber::flow`), and that port feeds the 1-D primary.
 
 Why `"auto"`: the shipped engines and every existing user file keep running
 exactly as before (section 4, test g), while a file that describes its
@@ -195,7 +251,9 @@ network from the legacy parameters. Two things to know when doing that:
 
 Linux, clang 18, headless build of the core library and the script
 interpreter (`test/` with gtest; the engine-level tests need
-`engine-sim-script-test`, which runs about 8 minutes).
+`engine-sim-script-test`, which runs about 10 minutes). The Windows CI builds
+`engine-sim-test` and runs the 1-D unit and network tests, and runs the test
+engine of `test/data` on the 1-D model through the headless runner.
 
 Unit and network tests (`engine-sim-test`):
 
@@ -204,10 +262,14 @@ Unit and network tests (`engine-sim-test`):
 | (a) closed-open pipe at rest, 2000 steps | pressure, velocity, temperature unchanged to 1e-6 / 1e-9; mass and energy to 1e-9 |
 | (b) +2 kPa pulse at the closed end of a 1 m closed-open pipe | returns inverted (-1755 Pa at the wall) after 5.740 ms vs 2L/c = 5.778 ms (-0.66%) |
 | (c) quarter-wave resonance, 0.8 m closed-open pipe | 108.0 Hz vs c/4L = 108.16 Hz (-0.15%) |
-| (d) mass conservation, 4 pulsed ports into a 4-1 for 1 s | imbalance 1e-10 % of the throughput (the engine runs below give 1e-13 relative) |
+| (d) mass conservation, 4 pulsed ports into a 4-1 for 1 s, driven like the engine | imbalance 5e-11 % of the throughput (round-off) |
 | (e) 3-way junction, pulse from one branch | mass conserved to 1e-9; transmitted amplitude 0.455 vs linear acoustics 2A1/(A1+A2+A3) = 0.471 (-3.4%); the two receiving branches agree to 0.004% |
-| orifice | choked mass flow matches the isentropic formula to 4e-6 (the gas constant rounding) |
-| port exchange | mass to 1e-9, total energy to 1e-6 over a 2 ms blowdown |
+| orifice | choked and subsonic mass flow match the isentropic nozzle formulas to 1e-9, the two meet at the critical pressure ratio, the flow falls monotonically to zero as the pressures equalise |
+| (h) shock tubes against the exact Riemann solution | Sod (1 / 0.125 kg/m3, 1e5 / 1e4 Pa): L1 density error 1.09% on 100 cells, 0.34% on 400, pressure 0.23%, star-region pressure 30305 Pa vs exact 30313 Pa; exhaust blowdown (5 bar 1200 K into 1 bar 300 K): 2.24% / 0.81%, 278517 vs 278552 Pa; mass to 1e-15 |
+| (i) temperature front (900 K gas behind 300 K gas, same p and u = 50 m/s) through junctions | two-pipe step, two-ended and three-ended junction, both flow directions: pressure stays within 1e-4 Pa and velocity within 1e-6 m/s of uniform (the receiving-end density of the first version gave 6.5-10 kPa and 23-45 m/s) |
+| port boundary, energy | mass and total energy (port internal + bulk kinetic, pipes) to 1e-16 relative over 1.5 ms: port at rest and moving at 38 / 20 m/s, emptying (3 atm to 1 atm) and filling (0.5 atm to 1 atm) |
+| port boundary, steady flow | a port held at 1.3 bar, 900 K into a frictionless pipe open at its end: 0.0593928 kg/s through the boundary and 0.0593931 kg/s out of the pipe vs the orifice formula's 0.0593936 kg/s |
+| coupled ports: 4 ports with a valve-like feed into a 4-1, driven like the engine | the port flow changes direction 19-32 times per cycle (the waves; with the cell-source exchange it reversed on 90% of the 3200 sub-steps per cycle). RMS port gauge pressure on 1 cm cells at 10 / 20 / 40 kHz: 6977 / 6977 / 6991 Pa (7135 / 7016 / 6997 with one explicit port step instead of the midpoint rule); at 20 kHz on 4 / 2 / 1 / 0.5 cm cells: 5402 / 6422 / 6977 / 7030 Pa (the port's own ring near c A / (2 pi V), 2 kHz here, is above what 4 cm cells carry) |
 
 Engine-level tests (`engine-sim-script-test`):
 
@@ -215,7 +277,8 @@ Engine-level tests (`engine-sim-script-test`):
   through `set_engine(...)`), forced to the 1-D model with
   `exhaust_model: "1d"`, compile, build their networks and run 2 s of
   cranking plus 1.5 s on the dyno at 2500 rpm without NaN; 23 start within the
-  2 s crank and make positive torque (30 to 620 N m). The radial-9 and the
+  2 s crank and make positive torque (27 to 612 N m), with the mass account
+  closed to 4e-13 of the throughput. The radial-9 and the
   Merlin V12 need a longer crank than the test gives them, in both models
   (the radial-9 starts with 6 s of cranking and makes 778 N m at 2000 rpm;
   the Merlin did not start in 8 s with either model in this harness).
@@ -235,112 +298,147 @@ Engine-level tests (`engine-sim-script-test`):
 Pre-existing: upstream's own `GasSystemTests.PressureEquilibriumMaxFlow*`
 and `FunctionTests.FunctionGaussianTest` fail, and
 `SynthesizerTests.SynthesizerSystemTestSingleThread` hangs, identically on
-the untouched tree. Not caused by this branch.
+the untouched tree; `SynthesizerTests.SynthesizerSystemTest` fails its sample
+checks and then crashes, here and on the exhaust-1d head before this change
+(the synthesizer is upstream's code apart from two includes). Not caused by
+this branch.
 
 ## 5. Performance
 
-Test machine: 2-core Xeon at 2.8 GHz (shared; CPU time of the process is
-reported, wall time was up to 3x higher under load). GM LS V8, two 4-1
-systems, 0.74 m primaries, 2.5 m and 4.4 m collectors, `simulation_frequency`
-10000, dyno hold 4000 rpm, 3 s, no audio:
+Test machine: 2-core Xeon at 2.8 GHz, shared with other jobs (CPU time of
+the process is reported; wall time was 2-3x higher under load). Dyno hold,
+4 s with 2 s settling, no audio, each engine at its own
+`simulation_frequency`:
 
-| model | cells | sub-steps / step | CPU s per simulated s | relative |
-|---|---|---|---|---|
-| legacy | - | - | 0.87 | 1.0 |
-| 1-D, 4 cm (default) | 340 | 3.6 | 1.85 | 2.1 |
-| 1-D, 3 cm | 456 | 4.5 | ~2.7 | ~3.1 |
-| 1-D, 2 cm | 663 | 6.6 | ~4.9 | ~5.6 |
+| engine | sim. frequency | model | cells | CPU s per simulated s | relative | torque, N m |
+|---|---|---|---|---|---|---|
+| GM LS V8 (two 4-1), 4000 rpm | 10 kHz | legacy | - | 0.71 | 1.0 | 714.0 |
+| GM LS V8 (two 4-1), 4000 rpm | 10 kHz | 1-D, 4 cm | 340 | 4.14 | 5.8 | 719.8 |
+| GM LS V8 (two 4-1), 4000 rpm | 10 kHz | 1-D, 3 cm | 456 | 4.73 | 6.7 | 719.3 |
+| GM LS V8 (two 4-1), 4000 rpm | 10 kHz | 1-D, 2 cm | 663 | 6.23 | 8.8 | 718.7 |
+| Subaru EJ25 (two systems), 3500 rpm | 20 kHz | legacy | - | 0.76 | 1.0 | 207.1 |
+| Subaru EJ25 (two systems), 3500 rpm | 20 kHz | 1-D, 4 cm | 424 | 6.99 | 9.2 | 199.6 |
+| Lexus LFA V10, 5000 rpm | 6.5 kHz | legacy | - | 0.69 | 1.0 | 197.5 |
+| Lexus LFA V10, 5000 rpm | 6.5 kHz | 1-D, 4 cm | 454 | 3.44 | 5.0 | 150.6 |
 
-Per cell update the solver costs about 65 ns in isolation and 80 ns inside
-the engine (cache pressure, junctions). The cost scales with `cells x
-sub-steps`, i.e. with `1 / cell_size^2`, which is why 2 cm (the first
-target) was about 5x the legacy cost and 4 cm was chosen as the default:
-it keeps a V8 near 2x legacy. Trade-off: the shortest wavelength carried
-cleanly is about 8-10 cells, so 4 cm resolves up to ~1-1.5 kHz in hot gas
-(c ~ 600-800 m/s) and 2 cm up to ~2-3 kHz; the firing harmonics of every
-shipped engine are well inside the 4 cm range, the hiss and crack above
-2 kHz are left to the impulse response. Torque changed by 3-4% between 2 cm
-and 4 cm on the V8 (678 vs 703 N m at 4000 rpm). Other shipped engines at
-their own `simulation_frequency`: 0.7-2.2 CPU s per simulated second with
-the 1-D model (the radial-9 with two default 12 m collectors, 978 cells,
-is the heaviest).
+(The LFA's 6.5 kHz is 4.6 degrees of crank per step at 5000 rpm; neither
+model is converged there, section 6.) The test inline-4 of section 6 at
+20 kHz: legacy 0.5-0.8 CPU s per simulated second, 1-D 3.6-3.9 on 4 cm cells,
+4.3-4.5 on 2 cm, 9.1 on 1 cm, 21 on 0.5 cm.
 
-Things that were tried and kept: one half-step predictor per cell (not per
-face), no divisions in the hot loop, analytic Newton derivatives and one
-`pow` per branch in the junctions, cached orifice constants, the port jet
-speed removed from the CFL estimate (it is a cell source, not a face flux:
-15% fewer sub-steps, same results). Not done: single precision (the mass
-accumulators would drift over long runs), SIMD across cells (the HLLC
-branches need masking; large effort, also for MSVC), threading one exhaust
-system per thread (synchronisation 10000 times a second). On a slower
-machine use `pipe_cell_size: 6 * units.cm` or `legacy_exhaust: true`.
+The network advances after every one of the engine's 8 fluid sub-steps
+(section 2.4), so with 4 cm cells it takes 8 pipe steps per simulation step
+where its CFL step would allow 1-3; finer cells cost more only once their
+CFL step is shorter than the fluid sub-step (about 1 cm at 20 kHz, 3 cm at
+10 kHz). Each pipe step solves every port boundary twice (the midpoint rule)
+and the junctions once. The earlier, loosely coupled scheme cost about half
+as much (1.85 CPU s for the LS at 10 kHz with 4 cm cells) but did not
+converge. Per cell update the solver costs about 65 ns in isolation and
+80 ns inside the engine. Bandwidth: the shortest wavelength carried cleanly
+is about 8-10 cells, so 4 cm resolves up to ~1-1.5 kHz in hot gas (c ~
+600-800 m/s) and 2 cm up to ~2-3 kHz; the firing harmonics of every shipped
+engine are inside the 4 cm range, the hiss and crack above 2 kHz are left
+to the impulse response.
+
+Kept: one half-step predictor per cell (not per face), no divisions in the
+hot loop, analytic Newton derivatives and one `pow` per branch in the
+junctions, cached orifice constants, the port face solve started with
+secant steps from the last root. Not done yet: advancing the pipe
+interiors at their own CFL step while the port boundaries keep the fluid
+sub-step against a first cell held for up to one CFL step (the incoming
+characteristic held, as the method of characteristics does over a step,
+with the face fluxes accumulated); it would cut the 4 cm cost by roughly the
+factor between the two steps and needs the convergence checks of section 6
+repeated. Also not done: single precision, SIMD across cells, one exhaust
+system per thread. On a slow machine use `legacy_exhaust: true`; coarser
+cells than 4 cm save little now.
 
 ## 6. Physics check: primary length
 
 2.0 L inline-4, 4-1 header, 721 mm x 44 mm primaries, 488 mm x 79.5 mm
-collector (`test/data/exhaust_tuner_i4.mr`, rev limit raised to 9000 for the
-7800 rpm point), wide open, dyno hold, mean torque over the last 2 s of a 4 s
-run. Primaries scaled by 0.9 / 1.0 / 1.1. Cells 4 cm.
-
-4 cm cells (default):
+collector (`test/data/exhaust_tuner_i4.mr`, 20 kHz, rev limit raised to 9000
+for the 7800 rpm point), wide open, dyno hold, mean torque over the last 2 s
+of a 4 s run. Primaries scaled by 0.9 / 1.0 / 1.1. Torque in N m:
 
 | model | primaries | 4000 rpm | 5000 rpm | 6000 rpm | 7000 rpm | 7800 rpm |
 |---|---|---|---|---|---|---|
-| legacy | 649 mm (x0.9) | 143.8 | 173.7 | 193.1 | 184.0 | 166.0 |
+| legacy | 649 mm (x0.9) | 144.0 | 173.7 | 193.0 | 184.1 | 166.1 |
 | legacy | 721 mm (x1.0) | 145.6 | 178.1 | 190.7 | 183.0 | 163.0 |
-| legacy | 793 mm (x1.1) | 148.8 | 178.3 | 196.3 | 180.9 | 160.3 |
-| 1-D | 649 mm (x0.9) | 54.6 | 138.0 | 180.7 | 183.1 | 186.6 |
-| 1-D | 721 mm (x1.0) | 61.1 | 153.2 | 148.5 | 191.5 | 187.7 |
-| 1-D | 793 mm (x1.1) | 97.4 | 133.6 | 157.2 | 197.4 | 187.7 |
+| legacy | 793 mm (x1.1) | 148.9 | 178.5 | 190.5 | 181.4 | 159.9 |
+| 1-D, 4 cm | 649 mm (x0.9) | 54.1 | 136.9 | 169.4 | 184.7 | 187.4 |
+| 1-D, 4 cm | 721 mm (x1.0) | 61.5 | 157.9 | 141.2 | 193.1 | 188.2 |
+| 1-D, 4 cm | 793 mm (x1.1) | 96.8 | 130.0 | 154.6 | 198.1 | 188.3 |
+| 1-D, 2 cm | 649 mm (x0.9) | 53.0 | 137.6 | 165.0 | 184.6 | 187.6 |
+| 1-D, 2 cm | 721 mm (x1.0) | 60.3 | 164.0 | 138.5 | 194.0 | 187.8 |
+| 1-D, 2 cm | 793 mm (x1.1) | 95.9 | 126.2 | 152.2 | 197.9 | 188.2 |
 
-2 cm cells:
+The legacy model changes by 1-4% with the length (the longer primary is a
+bigger lumped volume); the 1-D model by 20% at 5000-6000 rpm and 80% at
+4000 rpm, and the three lengths come together at 7800 rpm, where the tuned
+pulse falls outside the overlap. 4 cm and 2 cm cells give the same picture
+and agree within 3.7% everywhere (the largest difference is the 721 mm
+primaries at 5000 rpm).
 
-| model | primaries | 4000 rpm | 5000 rpm | 6000 rpm | 7000 rpm | 7800 rpm |
-|---|---|---|---|---|---|---|
-| 1-D | 649 mm (x0.9) | 66.7 | 128.2 | 170.6 | 183.5 | 163.5 |
-| 1-D | 721 mm (x1.0) | 69.6 | 141.8 | 183.5 | 183.1 | 163.5 |
-| 1-D | 793 mm (x1.1) | 92.7 | 165.9 | 185.6 | 183.9 | 162.4 |
+Convergence, 721 mm primaries at 6000 rpm: 141.2 / 138.5 / 137.5 / 136.9 N m
+on 4 / 2 / 1 / 0.5 cm cells (20 kHz); 137.8 / 138.5 / 139.5 N m at 15 / 20 /
+40 kHz on 2 cm cells. The combustion model scales each burn's efficiency by a
+random number (`CombustionChamber::ignite`, `std::rand`, seeded once per
+run): four seeds put the 4 cm result between 141.0 and 143.9 N m and the
+2 cm result between 138.5 and 142.0 N m, so differences of a few N m between
+runs are that scatter. At 4000 rpm: 61.5 / 60.3 / 60.0 N m on 4 / 2 / 1 cm.
+Below 15 kHz the torque falls away in both models (at 10 kHz, 3.6 degrees of
+crank per step: 96.4 against 138.5 N m for the 1-D model on 2 cm cells,
+131.5 against 190.7 N m for the legacy one): engine-sim's own cylinder,
+valve and port flows need a step of no more than about 2 degrees at the
+highest rpm used (the 2.4 degrees of 15 kHz at 6000 rpm, or of the LS V8 at
+4000 rpm and 10 kHz, were still converged; legacy 194.3 / 190.7 / 193.2 N m
+at 15 / 20 / 40 kHz). Before
+the port boundary of section 2.4 the same 721 mm, 6000 rpm point gave
+148.7 / 183.6 / 118.5 / -6.7 N m on 4 / 2 / 1 / 0.5 cm, and the two grids
+disagreed on the direction of the length change.
 
-(torque in N m; the legacy rows do not depend on the cell size)
-
-The legacy model changes by 1-3% (the longer primary is a bigger lumped
-volume); the 1-D model changes by 10-40% at 4000-6000 rpm, in both grids.
-The low-rpm hole (4000-5000 rpm) is the 4-1 interference: the neighbour's
-blowdown pulse, transmitted through the junction and doubled at the closed
-valve, arrives at the port during valve overlap at 1.5-1.6 bar and pushes
-exhaust gas into the cylinder and the intake runner. The effect is real for
-4-1 headers but its size here is large; see the limits below.
-
-The two grids disagree above 6000 rpm (e.g. 721 mm at 6000 rpm: 148 N m at
-4 cm vs 184 N m at 2 cm; at 7800 rpm 188 vs 164). The 2 cm results are the
-smoother ones (torque rises monotonically with primary length at 5000-6000
-rpm and the three lengths converge at 7800 rpm, as expected when the tuned
-pulse falls outside the overlap window); at 4 cm the blowdown pulse front
-(a few cm wide at these speeds) is under-resolved and its arrival time at
-the port shifts. Where the exact torque matters, run with
-`pipe_cell_size: 2 * units.cm` (section 5 gives the cost); the sound and
-the existence of the tuning effect are the same at both sizes. The V8 at
-4000 rpm (where the pulses are longer) moved only 3-4% between the grids.
+The low-rpm hole (4000 rpm, 721 mm) is the 4-1 interference. Traced over a
+cycle of cylinder 1 (2 cm cells): the cylinder that fires 180 degrees later
+opens its exhaust at 300 degrees of cylinder 1's cycle; its blowdown pulse
+runs 0.72 m to the junction and 0.72 m back up cylinder 1's primary, and
+reaches cylinder 1's port at overlap TDC: the port pressure peaks at 1.52 bar
+at 367 degrees (both valves are open past 0.25 mm from 311 to 411 degrees;
+the legacy model's port stays at 1.02 bar). It pushes exhaust gas back into
+the cylinder (0.0021 mol per cycle, 14% of what left) and on through the
+open intake valve into the lumped intake runner (0.0019 mol during overlap).
+The intake stroke then draws 0.0231 mol instead of 0.0432, and at intake
+closing the cylinder holds 53% of the legacy model's fuel; torque 60 against
+146 N m. With 793 mm primaries the pulse peaks later, at 1.78 bar at 390
+degrees with the exhaust valve almost shut (0.8 mm): 67% of the legacy
+model's fuel and 97 N m. A real 4-1 header shows this interference; its depth here is larger
+than a dyno would show because the junction has no losses, the wall
+temperature is fixed, and the intake runner is one lumped volume, so the
+exhaust gas pushed into it stays in the next charge instead of being swept
+back by an intake wave.
 
 ## 7. Sound
 
-WAV previews rendered through the harness (same synthesizer settings as the
-app, impulse responses from `es/sound-library`), held rpm, last 1.5 s
-analysed with a Hann window:
+WAV previews rendered through the headless runner (same synthesizer settings
+as the app, impulse responses from `es/sound-library`), held rpm, the last
+1.5 s analysed with a Hann window; line strengths are amplitude ratios to the
+strongest line, band edges kept off the firing harmonics (the I4 fires at
+200 Hz at 6000 rpm, the V8 at 267 Hz at 4000 rpm):
 
-| run | RMS | clipped samples | strongest lines (Hz : relative) | energy 150-400 / 400-1000 / 1000-3000 Hz |
+| run | RMS | clipped samples | strongest lines (Hz : relative) | energy 150-350 / 350-1000 / 1000-3000 Hz |
 |---|---|---|---|---|
-| I4 6000 rpm, legacy | 27559 | 54% | 200:1.00 600:0.15 400:0.07 800:0.06 | 97% / 3% / 0.1% |
-| I4 6000 rpm, 1-D 4 cm | 12945 | 2.5% | 400:1.00 200:0.77 800:0.57 1600:0.31 600:0.29 1200:0.27 | 59% / 29% / 11% |
-| V8 (LS) 4000 rpm, legacy | 17530 | 3.0% | 433:1.00 267:0.36 400:0.25 167:0.23 | 20% / 78% / 0.4% |
-| V8 (LS) 4000 rpm, 1-D 4 cm | 14943 | 2.1% | 433:1.00 933:0.60 800:0.56 700:0.49 633:0.46 | 7% / 76% / 17% |
+| I4 6000 rpm, legacy | 27558 | 54.1% | 200:1.00 600:0.15 400:0.07 800:0.06 1600:0.02 1400:0.01 | 97% / 3% / 0% |
+| I4 6000 rpm, 1-D 4 cm | 13474 | 2.8% | 400:1.00 200:0.67 800:0.57 600:0.33 1200:0.20 1600:0.18 | 23% / 72% / 4% |
+| V8 (LS) 4000 rpm, legacy | 17527 | 3.0% | 433:1.00 267:0.36 400:0.28 167:0.23 300:0.16 100:0.14 | 16% / 82% / 0% |
+| V8 (LS) 4000 rpm, 1-D 4 cm | 14998 | 2.0% | 633:1.00 433:0.68 1000:0.59 400:0.50 700:0.38 567:0.38 | 4% / 78% / 17% |
 
-The firing fundamental (200 Hz for the I4 at 6000 rpm, 267 Hz for the V8 at
-4000) and its harmonics come through in the 1-D model; the legacy I4 is a
-nearly pure 200 Hz tone that the leveler clips more than half the time,
-while the 1-D signal has 10-20% of its energy above 1 kHz (blowdown pulse
-shape) and clips little. Files: `i4_legacy_6000.wav`, `i4_1d_6000.wav`,
-`ls_legacy_4000.wav`, `ls_1d_4000.wav` in the harness output (not committed).
+The legacy I4 is a nearly pure 200 Hz tone that the leveler clips more than
+half the time; the 1-D I4 spreads its energy over the firing harmonics (200,
+400, 600, 800 Hz and on) and clips little. On the V8 the 1-D model moves energy
+from the 433 Hz line into the lines from 400 Hz to 1 kHz and carries 17% of it
+above 1 kHz (the blowdown pulse shape). Files: `i4_legacy_6000.wav`,
+`i4_1d_6000.wav`, `ls_legacy_4000.wav`, `ls_1d_4000.wav` in the harness output
+(not committed). The legacy renders are the same as before this branch (the
+I4 render was redone: identical statistics).
 
 ## 8. Known limits
 
@@ -352,14 +450,27 @@ shape) and clips little. Files: `i4_legacy_6000.wav`, `i4_1d_6000.wav`,
   the 4-1 low-rpm hole deeper than a dyno would show.
 * The port -> primary orifice (`primary_flow_rate`) is inherited from the
   legacy structure. Physically the port and primary are one duct; the
-  orifice keeps the old parameter meaningful but adds a sudden-expansion
-  loss at the pipe inlet.
+  orifice keeps the old parameter meaningful, and where its `Cd A` is below
+  the pipe area the boundary adds a sudden-expansion loss at the pipe inlet
+  (the jet's excess kinetic energy is mixed out at the face pressure). The
+  calculator's exports carry the donor engine's rating: `k_carb(200)` gives
+  `Cd A` = 10.8 cm^2, 70% of the test engine's 44 mm primary (15.5 cm^2).
+* engine-sim itself (cylinder, valve and port flows, both exhaust models)
+  needs a simulation step of no more than about 2 degrees of crank at the
+  highest rpm used; at 3.6 degrees per step the test inline-4 lost a third of
+  its torque in both models (section 6). Several shipped engines run at
+  5-6.5 kHz, i.e. 4-6 degrees per step at 5000 rpm; their torque is not
+  converged in either model, and the 1-D model departs further from the
+  legacy one there.
+* The network advances at the engine's fluid sub-step (8 x
+  `simulation_frequency`), so coarser cells than 4 cm save little time
+  (section 5).
 * Cones are limited to a linear taper inside one pipe; steps need two
   pipes; no X/H crossovers between exhaust systems, no mufflers or chambers
   (the impulse response still does that), no catalyst.
 * `sound_attenuation` has no effect on 1-D systems.
 * Primaries are straight pipes of one diameter; the head's port volume is
   lumped.
-* Cell size trades CPU for bandwidth (section 5). The 200-cell cap coarsens
-  very long pipes silently.
+* Cell size trades CPU for bandwidth and accuracy (sections 5 and 6). The
+  200-cell cap coarsens very long pipes silently.
 * The radiated sound is a monopole at 1 m; no directivity, no ground.

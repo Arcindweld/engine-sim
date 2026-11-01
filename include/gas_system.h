@@ -66,6 +66,8 @@ class GasSystem {
             double chokedFlowLimit,
             double chokedFlowRateCached);
         double loseN(double dn, double E_k_per_mol);
+        // Bulk momentum leaves with the gas that leaves (as in flow()): scale it by k = 1 - fraction removed
+        inline void scaleMomentum(double k) { m_state.momentum[0] *= k; m_state.momentum[1] *= k; }
         double gainN(double dn, double E_k_per_mol, const Mix &mix = defaultMix());
         void dissipateExcessVelocity();
 

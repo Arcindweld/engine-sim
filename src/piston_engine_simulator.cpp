@@ -320,14 +320,25 @@ void PistonEngineSimulator::simulateStep_() {
         for (int j = 0; j < cylinderCount; ++j) {
             m_engine->getChamber(j)->flow(fluidTimestep);
         }
+
+        // 1-D exhaust: the networks advance after every fluid sub-step, once the cylinders have flowed into their
+        // ports (CFL sub-stepped inside; each pipe sub-step first solves the port boundaries, port volume <->
+        // primary inlet face). Advancing the pipes once per simulation step left the ports exchanging eight times
+        // with a frozen first cell, and the test I4 at 6000 rpm made 148.7 / 183.6 / 118.5 / -6.7 N m on 4 / 2 /
+        // 1 / 0.5 cm cells (docs/exhaust-1d.md, sections 2.4 and 6).
+        for (int j = 0; j < exhaustSystemCount; ++j) {
+            ExhaustSystem *exhaust = m_engine->getExhaustSystem(j);
+            if (!exhaust->isLegacy()) {
+                exhaust->advanceNetwork(fluidTimestep);
+            }
+        }
     }
 
-    // 1-D exhaust pipes advance once per simulation step (CFL sub-stepped
-    // inside) with the port fluxes accumulated over the fluid sub-steps.
+    // and once per simulation step: close the step (outlet flow over the step, the sound source; outlet state)
     for (int j = 0; j < exhaustSystemCount; ++j) {
         ExhaustSystem *exhaust = m_engine->getExhaustSystem(j);
         if (!exhaust->isLegacy()) {
-            exhaust->processNetwork(timestep);
+            exhaust->finishNetworkStep(timestep);
         }
     }
 
@@ -390,8 +401,6 @@ void PistonEngineSimulator::writeToSynthesizer() {
     const double attenuation = std::min(std::abs(filteredEngineSpeed()), 40.0) / 40.0;
     const double attenuation_3 = attenuation * attenuation * attenuation;
 
-    static double lastValveLift[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-
     const double timestep = getTimestep();
     const int cylinderCount = m_engine->getCylinderCount();
     for (int i = 0; i < cylinderCount; ++i) {
@@ -415,8 +424,6 @@ void PistonEngineSimulator::writeToSynthesizer() {
                 1.0 * (chamber->m_exhaustRunnerAndPrimary.pressure() - units::pressure(1.0, units::atm))
                 + 0.1 * chamber->m_exhaustRunnerAndPrimary.dynamicPressure(1.0, 0.0)
                 + 0.1 * chamber->m_exhaustRunnerAndPrimary.dynamicPressure(-1.0, 0.0));
-
-        lastValveLift[i] = head->exhaustValveLift(piston->getCylinderIndex());
 
         const double delayedExhaustPulse =
             m_delayFilters[i].fast_f(exhaustFlow);
