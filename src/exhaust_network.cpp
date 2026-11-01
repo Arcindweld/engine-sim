@@ -18,10 +18,6 @@
 
 namespace {
     constexpr double Pi = 3.14159265358979323846;
-    // Largest share of the end cell's mass that one port exchange (one fluid
-    // sub-step) may draw back into the port volume; keeps the explicit
-    // coupling bounded when the pipe end is at a much higher pressure.
-    constexpr double MaxReverseCellFraction = 0.2;
     // Same role as the 0.9 clamp in GasSystem::flow for the port volume.
     constexpr double MaxForwardMoleFraction = 0.9;
 }
@@ -38,6 +34,8 @@ ExhaustNetwork::ExhaustNetwork() {
     m_outletMassFlowDerivative = 0.0;
     m_massIn = m_massOut = m_initialMass = 0.0;
     m_lastSubSteps = 0;
+    m_stepOutflow = m_stepTime = 0.0;
+    m_stepSubSteps = 0;
 }
 
 ExhaustNetwork::~ExhaustNetwork() {
@@ -48,8 +46,8 @@ ExhaustNetwork::~ExhaustNetwork() {
 int ExhaustNetwork::addPrimary(const PrimarySpec &spec) {
     Primary prim;
     prim.spec = spec;
-    prim.jetSpeed = 0.0;
     prim.lastMassFlow = 0.0;
+    prim.facePressure = 0.0;
     m_primaries.push_back(prim);
     return static_cast<int>(m_primaries.size()) - 1;
 }
@@ -80,7 +78,10 @@ void ExhaustNetwork::build(const Parameters &params) {
 
     for (Primary &prim : m_primaries) {
         Pipe1D::Section s;
-        s.length = prim.spec.length;
+        // a primary needs some length to carry cells: a zero length (primary_tube_length 0 with no per-cylinder
+        // length) gave a zero cell size, a CFL loop that never advanced and NaN mass. Under a millimetre it
+        // becomes one cell length (a port stub); real short primaries are left as given.
+        s.length = prim.spec.length < 1e-3 ? params.cellSize : prim.spec.length;
         s.inletDiameter = s.outletDiameter = prim.spec.diameter;
         pp.sections.assign(1, s);
         prim.pipe.initialize(pp);
@@ -129,6 +130,8 @@ void ExhaustNetwork::build(const Parameters &params) {
     m_massIn = m_massOut = 0.0;
     m_initialMass = totalMass();
     m_lastSubSteps = 0;
+    m_stepOutflow = m_stepTime = 0.0;
+    m_stepSubSteps = 0;
     m_built = true;
 }
 
@@ -152,155 +155,220 @@ double ExhaustNetwork::orificeFlow(double CdA, double p0, double T0, double pd) 
     return CdA * std::sqrt(p0 * rho0) * psi;
 }
 
-double ExhaustNetwork::jetSpeed(double p0, double T0, double pd) const {
-    const double g = m_gamma, g1 = g - 1;
-    return std::sqrt(std::max(0.0, 2 * m_cp * T0 * (1 - std::pow(std::max(pd / p0, m_prc), g1 / g))));
-}
-
-// Flow between the port GasSystem and the first cell of the primary
-// (reference: valveFlow, and the chamber coupling that adds the exchanged
-// mass straight to the cell).  Positive mass flow = into the pipe.  Both
-// sides are updated at once, at the fluid sub-step rate, so the orifice
-// always sees the current pressures on both sides; the pipe's inlet face is
-// then a wall during the pipe step.
-void ExhaustNetwork::exchangePort(int index, double dt) {
-    Primary &prim = m_primaries[index];
+// The port boundary at a primary's inlet face, solved before every pipe sub-step (the valve boundary of the
+// method of characteristics: Benson, The Thermodynamics and Gas Dynamics of Internal-Combustion Engines, vol. 1,
+// Oxford 1982; Winterbone & Pearson, Theory of Engine Manifold Design, 2000). The face pressure p_f is the
+// one at which the flow the pipe takes along its incoming characteristic (u_f = J + 2 c_f / (gamma - 1), with
+// J = u - 2 c / (gamma - 1) of the first cell and c_f isentropic from it) equals the compressible orifice flow
+// between the port volume and the face:
+//   port -> pipe (port pressure above the face's closed-end pressure): the gas at the face is port gas,
+//     T_f = (h0_port - u_f^2 / 2) / cp, rho_f = p_f / (R T_f) (the contact sits at the face, as at the open end),
+//     and the orifice runs from the port's (p, T) to p_f;
+//   pipe -> port: the gas at the face is pipe gas, isentropic from the first cell to p_f, and the orifice runs
+//     from its stagnation state to the port pressure.
+// The port volume gives up or takes exactly the face's mass, enthalpy and species flux over the sub-step. For a
+// small pressure difference the flow is then limited by the pipe's wave impedance (m ~ A dp / c) instead of the
+// orifice's square root, whose slope is unbounded at dp = 0. The first version computed the orifice flow from
+// the first cell's own state and added it to the cell as a source: between a 50 cc port and a 30-60 cc cell
+// that explicit square-root exchange settles into a two-step oscillation of the pressure difference of about
+// rho (C_d A dt c^2 (1/V_port + 1/V_cell))^2 / 2 (kPa at 20 kHz), so the flow reversed on nearly every
+// sub-step and the results moved with the cell size and the simulation frequency.
+void ExhaustNetwork::portBoundary(Primary &prim, double dts) {
     GasSystem *port = prim.spec.port;
-    Pipe1D &P = prim.pipe;
-    const int i = 0;
-    const double g = m_gamma, g1 = g - 1;
-
-    const double r = P.density(i), u = P.velocity(i), p = P.pressure(i);
-    const double T = p / (m_R * r);
-    const double T0 = T + 0.5 * u * u / m_cp;
-    const double p0 = p * std::pow(T0 / T, g / g1);
-
-    const double pr = port->pressure();
-    const double Tr = port->temperature();
-    const double M = m_params.molarMass;
-    const double CdA = prim.spec.orificeArea;
-
-    double m = 0.0, h = 0.0, uj = 0.0;
-    double x[Pipe1D::ScalarCount] = { 0.0, 0.0 };
-    GasSystem::Mix mix;
-
-    if (p0 > pr) {
-        // pipe -> port
-        m = -orificeFlow(CdA, p0, T0, pr);
-        const double limit = MaxReverseCellFraction * P.cellMass(i) / dt;
-        if (-m > limit) m = -limit;
-        h = m_cp * T0;
-        for (int k = 0; k < Pipe1D::ScalarCount; ++k) x[k] = P.scalar(i, k);
-    }
-    else if (port->n() > 0 && Tr > 0) {
-        // port -> pipe
-        m = orificeFlow(CdA, pr, Tr, p);
-        const double limit = MaxForwardMoleFraction * port->n() * M / dt;
-        if (m > limit) m = limit;
-        h = m_cp * Tr;
-        uj = jetSpeed(pr, Tr, p);
-        mix = port->mix();
-        x[0] = mix.p_fuel;
-        x[1] = mix.p_o2;
-    }
-
-    if (m == 0.0) {
+    double F[Pipe1D::FluxCount];
+    if (port == nullptr) {
+        portFace(prim, nullptr, dts, 0.0, F, &prim.facePressure);
+        prim.pipe.setEndFlux(-1, F);
         prim.lastMassFlow = 0.0;
         return;
     }
+    // Explicit midpoint rule for the port volume (second order): the face flux from the port's state half a
+    // sub-step on. The port relaxes toward the pipe on V / (c A), about 0.05 ms for a 50 cc port on a 44 mm pipe;
+    // one explicit step per 6 us sub-step (20 kHz) makes it relax about 7% too fast, a first-order error that left
+    // the torque drifting with the simulation frequency (the test I4 at 6000 rpm on 2 cm cells: 134.1 / 135.3 /
+    // 140.6 N m at 15 / 20 / 40 kHz with one step, 137.8 / 138.5 / 139.5 with this rule).
+    double F1[Pipe1D::FluxCount], pf1;
+    portFace(prim, port, dts, prim.facePressure, F1, &pf1);
+    GasSystem half = *port;
+    applyPortFlux(half, F1, 0.5 * dts);
+    portFace(prim, &half, dts, pf1, F, &prim.facePressure);
+    prim.pipe.setEndFlux(-1, F);
+    prim.lastMassFlow = F[0];
+    applyPortFlux(*port, F, dts);
+    m_massIn += F[0] * dts;
+}
 
-    const double dm = m * dt;
-    double dScalars[Pipe1D::ScalarCount];
-    for (int k = 0; k < Pipe1D::ScalarCount; ++k) dScalars[k] = dm * x[k];
+// Face flux of a primary's inlet for a given state of its port volume (see portBoundary); `port` null or empty, or
+// no orifice: a closed end at the characteristic closed-end pressure. `guess` (a face pressure) starts the root
+// search.
+void ExhaustNetwork::portFace(
+    const Primary &prim, const GasSystem *port, double dts, double guess, double *F, double *facePressure) const
+{
+    const Pipe1D &P = prim.pipe;
+    const double g = m_gamma, g1 = g - 1, k2 = 2 / g1, ex = g1 / (2 * g), ig = 1 / g;
+    const double A = P.endFaceArea(-1);
+    const double CdA = std::min(prim.spec.orificeArea, A);   // never wider than the pipe it feeds
 
-    if (m > 0) {
-        const double dn = dm / M;
-        // internal energy leaves with the gas (as in GasSystem::flow) plus the
-        // flow work p v = R T per mole, so the pipe receives the full enthalpy
-        port->loseN(dn, port->kineticEnergyPerMol());
-        port->changeEnergy(-dn * constants::R * Tr);
-        // the jet brings its momentum in the +x direction
-        P.addToCell(i, dm, dm * uj, dm * h, dScalars);
-        prim.jetSpeed = std::max(prim.jetSpeed, uj);
+    const double rc = P.density(0), uc = P.velocity(0), pc = P.pressure(0);
+    const double cc = std::sqrt(g * pc / rc);
+    const double J = uc - k2 * cc;                 // left-running invariant reaching the face from the pipe
+    const double cWall = -J / k2;                  // face sound speed (cell entropy) for u_f = 0
+    const double pWall = cWall > 0 ? pc * std::pow(cWall / cc, 1 / ex) : 0.0;
+
+    for (int k = 0; k < Pipe1D::FluxCount; ++k) F[k] = 0.0;
+    const bool open = port != nullptr && CdA > 0 && port->n() > 0 && port->temperature() > 0;
+    const double pr = open ? port->pressure() : 0.0;
+    if (!open || pr == pWall) {
+        F[1] = pWall * A;
+        *facePressure = pWall;
+        return;
+    }
+    const double Tr = port->temperature();
+    const double M = m_params.molarMass;
+
+    // h(pf) rises through zero between lo and hi. Secant steps from the guess (the last root), which is usually
+    // within a fraction of a percent of the answer: three evaluations; Illinois (modified regula falsi) on the
+    // bracket when a step leaves it or does not settle
+    const double tolFlow = 1e-10 * CdA * pr / std::sqrt(m_R * Tr);
+    auto solve = [&](auto &&h, double lo, double hi) {
+        if (guess > lo && guess < hi) {
+            double x0 = guess, h0 = h(x0);
+            if (std::fabs(h0) < tolFlow) return x0;
+            double x1 = x0 * (1 + 1e-6), h1 = h(x1);
+            for (int it = 0; it < 4; ++it) {
+                if (std::fabs(h1) < tolFlow) return x1;
+                if (h1 == h0) break;
+                const double x2 = x1 - h1 * (x1 - x0) / (h1 - h0);
+                if (!(x2 > lo && x2 < hi)) break;
+                x0 = x1; h0 = h1; x1 = x2; h1 = h(x1);
+            }
+        }
+        double hlo = h(lo), hhi = h(hi);
+        if (!(hlo < 0)) return lo;
+        if (!(hhi > 0)) return hi;
+        double x = 0.5 * (lo + hi);
+        int side = 0;
+        for (int it = 0; it < 60; ++it) {
+            x = (lo * hhi - hi * hlo) / (hhi - hlo);
+            if (!(x > lo && x < hi)) x = 0.5 * (lo + hi);
+            const double hx = h(x);
+            if (hx == 0 || hi - lo < 1e-11 * hi || std::fabs(hx) < tolFlow) return x;
+            if (hx < 0) {
+                lo = x; hlo = hx;
+                if (side == -1) hhi *= 0.5;
+                side = -1;
+            }
+            else {
+                hi = x; hhi = hx;
+                if (side == +1) hlo *= 0.5;
+                side = +1;
+            }
+        }
+        return x;
+    };
+
+    double pf, uf, f, h0;
+    double x[Pipe1D::ScalarCount];
+    if (pr > pWall) {
+        // port -> pipe: port gas at the face; it carries its enthalpy and its share of the port's bulk kinetic
+        // energy (the port loses that share with its momentum, so the pipe has to receive it)
+        h0 = m_cp * Tr + (port->mass() > 0 ? port->bulkKineticEnergy() / port->mass() : 0.0);
+        const double uStar = std::sqrt(2 * g1 * h0 / (g + 1));   // sonic at the face
+        auto faceVelocity = [&](double p) { return std::min(uStar, J + k2 * cc * std::pow(p / pc, ex)); };
+        auto pipeFlow = [&](double p) {
+            const double u = faceVelocity(p);
+            return p / (m_R * (h0 - 0.5 * u * u) / m_cp) * u * A;
+        };
+        pf = solve([&](double p) { return pipeFlow(p) - orificeFlow(CdA, pr, Tr, p); }, pWall, pr);
+        uf = faceVelocity(pf);
+        f = pipeFlow(pf);
+        // at most 90% of the port's gas in one sub-step (as GasSystem::flow)
+        f = std::min(f, MaxForwardMoleFraction * port->n() * M / dts);
+        const GasSystem::Mix mix = port->mix();
+        x[0] = mix.p_fuel;
+        x[1] = mix.p_o2;
     }
     else {
-        const double dn = -dm / M;
-        mix.p_fuel = x[0];
-        mix.p_o2 = x[1];
-        mix.p_inert = std::max(0.0, 1.0 - x[0] - x[1]);
-        // the port is a fixed volume: the incoming enthalpy becomes internal energy
-        port->gainN(dn, h * M, mix);
-        // the gas that leaves takes its share of the cell's momentum
-        P.addToCell(i, dm, dm * u, dm * h, dScalars);
+        // pipe -> port: pipe gas at the face, isentropic from the first cell
+        auto faceVelocity = [&](double p) {
+            const double c = cc * std::pow(p / pc, ex);
+            return std::max(-c, J + k2 * c);
+        };
+        auto state = [&](double p, double *T0, double *p0) {
+            const double u = faceVelocity(p);
+            const double T = p / (m_R * rc * std::pow(p / pc, ig));
+            *T0 = T + 0.5 * u * u / m_cp;
+            *p0 = p * std::pow(*T0 / T, g / g1);
+            return -rc * std::pow(p / pc, ig) * u * A;      // kg/s out of the pipe
+        };
+        pf = solve([&](double p) {
+            double T0, p0;
+            const double out = state(p, &T0, &p0);
+            return orificeFlow(CdA, p0, T0, pr) - out;
+        }, pr, pWall);
+        double T0, p0;
+        f = -state(pf, &T0, &p0);
+        uf = faceVelocity(pf);
+        h0 = m_cp * T0;
+        for (int k = 0; k < Pipe1D::ScalarCount; ++k) x[k] = P.scalar(0, k);
     }
 
-    prim.lastMassFlow = m;
-    m_massIn += dm;
+    F[0] = f;
+    F[1] = f * uf + pf * A;
+    F[2] = f * h0;
+    for (int k = 0; k < Pipe1D::ScalarCount; ++k) F[3 + k] = f * x[k];
+    *facePressure = pf;
+}
+
+// The port volume takes the opposite of a face flux over dt: exactly -F[0] dt of mass, -F[2] dt of total energy
+// (internal plus bulk kinetic) and the species with them.
+void ExhaustNetwork::applyPortFlux(GasSystem &port, const double *F, double dt) const {
+    const double M = m_params.molarMass;
+    const double dm = F[0] * dt, dE = F[2] * dt;
+    if (dm > 0 && port.n() > 0) {
+        // gas leaves: it takes its share of the internal energy and of the bulk momentum (as GasSystem::flow; keeping
+        // the momentum would speed up the gas left behind and make kinetic energy); whatever else the flux carries
+        // (the flow work p v = R T per mole, the share of bulk kinetic energy) comes out of the internal energy
+        const double n0 = port.n();
+        const double dn = std::min(dm / M, n0);
+        const double share = dn / n0;
+        const double bulk = port.bulkKineticEnergy();
+        const double perMol = port.kineticEnergyPerMol();
+        // the species leave as the flux says (the port's own mix, unless the flux was taken half a sub-step on after
+        // gas came in), so the port keeps the rest exactly
+        GasSystem::Mix mix = port.mix();
+        if (n0 - dn > 0) {
+            mix.p_fuel = std::max(0.0, (n0 * mix.p_fuel - dn * F[3] / F[0]) / (n0 - dn));
+            mix.p_o2 = std::max(0.0, (n0 * mix.p_o2 - dn * F[4] / F[0]) / (n0 - dn));
+            mix.p_inert = std::max(0.0, 1.0 - mix.p_fuel - mix.p_o2);
+        }
+        port.scaleMomentum(1.0 - share);
+        port.loseN(dn, perMol);
+        port.changeEnergy(-(dE - dn * perMol - share * bulk));
+        port.changeMix(mix);
+    }
+    else if (dm < 0) {
+        // gas arrives with its stagnation enthalpy and no momentum along the port: the port's bulk motion slows and
+        // the kinetic energy that loses becomes heat (as GasSystem::flow does for its sink)
+        const double dn = -dm / M;
+        GasSystem::Mix mix;
+        mix.p_fuel = F[3] / F[0];
+        mix.p_o2 = F[4] / F[0];
+        mix.p_inert = std::max(0.0, 1.0 - mix.p_fuel - mix.p_o2);
+        const double bulk0 = port.bulkKineticEnergy();
+        port.gainN(dn, -dE / dn, mix);
+        port.changeEnergy(bulk0 - port.bulkKineticEnergy());
+    }
 }
 
 // Two pipes of different area meeting end to end (reference: junction).
 // Mass and energy cross unchanged; the momentum fluxes differ by the force on
 // the step.  Newton on the mass-flow mismatch, bisection as a fallback.
 void ExhaustNetwork::junction2(Pipe1D &a, Pipe1D &b, Junction &jn) const {
-    const int i = a.cellCount() - 1;
-    const double A1 = a.endFaceArea(+1), A2 = b.endFaceArea(-1);
-    const double rL = a.density(i), uL = a.velocity(i), pL = a.pressure(i);
-    const double rR = b.density(0), uR = b.velocity(0), pR = b.pressure(0);
-    const double g = m_gamma, g1 = g - 1;
-    const double cL = std::sqrt(g * pL / rL), cR = std::sqrt(g * pR / rR);
-    const double k2 = 2 / g1, ex = g1 / (2 * g), ig = 1 / g;
-    const double JL = uL + k2 * cL, JR = uR - k2 * cR;
-
-    // mass flow mismatch g(ps) = A1 rho1 u1 - A2 rho2 u2 with rho = rho0 s^ig,
-    // c = c0 s^ex, s = ps / p0; note s^ig = (s^ex)^(2/(g-1)) = (s^ex)^k2, and
-    // dg/dps follows analytically from d(rho u)/dps = rho (ig u -/+ k2 ex c) / ps
-    auto mismatch = [&](double ps, double *derivative) {
-        const double sLe = std::pow(ps / pL, ex), sRe = std::pow(ps / pR, ex);
-        const double c1 = cL * sLe, c2 = cR * sRe;
-        const double r1 = rL * std::pow(sLe, k2), r2 = rR * std::pow(sRe, k2);
-        const double u1 = JL - k2 * c1, u2 = JR + k2 * c2;
-        if (derivative) {
-            *derivative = (A1 * r1 * (ig * u1 - k2 * ex * c1) - A2 * r2 * (ig * u2 + k2 * ex * c2)) / ps;
-        }
-        return A1 * r1 * u1 - A2 * r2 * u2;
-    };
-
-    double ps = jn.pressure > 0 ? jn.pressure : 0.5 * (pL + pR);
-    bool ok = false;
-    for (int it = 0; it < 8; ++it) {
-        double d;
-        const double gv = mismatch(ps, &d);
-        if (!(d < 0)) break;
-        const double nx = ps - gv / d;
-        if (!(nx > 0)) break;
-        if (std::fabs(nx - ps) < 1e-7 * ps) { ps = nx; ok = true; break; }
-        ps = nx;
-    }
-    if (!ok || !(std::fabs(mismatch(ps, nullptr)) <= 1e-6 * std::fabs(A1 * rL * cL))) {
-        double lo = std::min(pL, pR) * 0.2, hi = std::max(pL, pR) * 5;
-        for (int it = 0; it < 60; ++it) {
-            const double mid = 0.5 * (lo + hi);
-            if (mismatch(mid, nullptr) > 0) lo = mid; else hi = mid;
-        }
-        ps = 0.5 * (lo + hi);
-    }
-    jn.pressure = ps;
-
-    const double c1 = cL * std::pow(ps / pL, ex), u1 = JL - k2 * c1, r1 = rL * std::pow(ps / pL, ig);
-    const double c2 = cR * std::pow(ps / pR, ex), u2 = JR + k2 * c2;
-    const double m = A1 * r1 * u1;                       // kg/s, + toward b
-    const bool up = m >= 0;
-    const double h0 = up ? c1 * c1 / g1 + 0.5 * u1 * u1 : c2 * c2 / g1 + 0.5 * u2 * u2;
-
-    double Fa[Pipe1D::FluxCount], Fb[Pipe1D::FluxCount];
-    Fa[0] = m; Fa[1] = m * u1 + ps * A1; Fa[2] = m * h0;
-    Fb[0] = m; Fb[1] = m * u2 + ps * A2; Fb[2] = m * h0;
-    for (int k = 0; k < Pipe1D::ScalarCount; ++k) {
-        const double xx = up ? a.scalar(i, k) : b.scalar(0, k);
-        Fa[3 + k] = Fb[3 + k] = m * xx;
-    }
-    a.setEndFlux(+1, Fa);
-    b.setEndFlux(-1, Fb);
+    // the general junction with two ends: it also hands the gas crossing into the other pipe its own (upstream)
+    // state, which the earlier two-pipe solver did not
+    JunctionEnd ends[2] = { { &a, +1 }, { &b, -1 } };
+    junctionN(ends, 2, jn);
 }
 
 // N pipe ends at one point (reference: junctionN): one pressure, mass flows
@@ -376,12 +444,80 @@ void ExhaustNetwork::junctionN(JunctionEnd *ends, int count, Junction &jn) const
         }
         ps = 0.5 * (lo + hi);
     }
+
+    // A receiving end (gas leaving the junction into that pipe) takes the mixed inflow's state at the face, as
+    // the open end takes the outside air: the velocity from the pipe's own characteristic at ps, the temperature
+    // from the mixed stagnation enthalpy (T = (h0mix - u^2/2) / cp) and the density ps / (R T). Giving it the
+    // receiving pipe's own density made the mass flux disagree with the energy flux and put a spurious pressure
+    // step at every temperature front (6-10 kPa for a 900 K pulse meeting 300 K gas). The Newton solution above,
+    // with each end's own density, is the start; the mass balance with the mixed state is then solved by the
+    // secant method (it falls monotonically with ps), with bisection as the fallback.
+    auto balance = [&](double pj) {
+        double mIn = 0, hIn = 0;
+        for (int k = 0; k < count; ++k) {
+            inflow(k, pj, nullptr);
+            E[k].m = ends[k].side * E[k].rs * E[k].us * E[k].A;
+            if (E[k].m > 0) {
+                mIn += E[k].m;
+                hIn += E[k].m * (E[k].cs * E[k].cs / g1 + 0.5 * E[k].us * E[k].us);
+            }
+        }
+        double t = 0;
+        for (int k = 0; k < count; ++k) {
+            if (E[k].m < 0 && mIn > 0) {
+                const double Tm = (hIn / mIn - 0.5 * E[k].us * E[k].us) / m_cp;
+                if (Tm > 1.0) {
+                    E[k].rs = pj / (m_R * Tm);
+                    E[k].m = ends[k].side * E[k].rs * E[k].us * E[k].A;
+                }
+            }
+            t += E[k].m;
+        }
+        return t;
+    };
+    double scale = 0;
+    for (int k = 0; k < count; ++k) scale += E[k].A * E[k].r * E[k].c;
+    const double tol = 1e-9 * scale;
+    double pa = ps, fa = balance(pa);
+    if (std::fabs(fa) > tol) {
+        double pb = pa * (1 + 1e-4), fb = balance(pb);
+        bool done = false;
+        for (int it = 0; it < 25; ++it) {
+            if (fb == fa) break;
+            const double pn = pb - fb * (pb - pa) / (fb - fa);
+            if (!(pn > 0)) break;
+            pa = pb; fa = fb; pb = pn; fb = balance(pb);
+            if (std::fabs(fb) <= tol || std::fabs(pb - pa) < 1e-10 * pb) { done = true; break; }
+        }
+        if (done) ps = pb;
+        else {
+            double lo = pMin * 0.2, hi = pMax * 5;
+            for (int it = 0; it < 64; ++it) {
+                const double mid = 0.5 * (lo + hi);
+                if (balance(mid) > 0) lo = mid; else hi = mid;
+            }
+            ps = 0.5 * (lo + hi);
+        }
+    }
     jn.pressure = ps;
-    mismatch(ps, nullptr);
+    balance(ps);
+    // the solve leaves a residual of order 1e-9 of the flux scale: scale the receiving ends to the inflow so the
+    // mass (and with it the energy and species) fluxes sum to zero to round-off
+    {
+        double mIn = 0, mOut = 0;
+        for (int k = 0; k < count; ++k) {
+            if (E[k].m > 0) mIn += E[k].m; else mOut -= E[k].m;
+        }
+        if (mIn > 0 && mOut > 0) {
+            const double scaleOut = mIn / mOut;
+            for (int k = 0; k < count; ++k) {
+                if (E[k].m < 0) E[k].m *= scaleOut;
+            }
+        }
+    }
 
     double mIn = 0, hIn = 0, xIn[Pipe1D::ScalarCount] = { 0.0, 0.0 };
     for (int k = 0; k < count; ++k) {
-        E[k].m = ends[k].side * E[k].rs * E[k].us * E[k].A;
         if (E[k].m > 0) {
             const double h0 = E[k].cs * E[k].cs / g1 + 0.5 * E[k].us * E[k].us;
             mIn += E[k].m;
@@ -406,10 +542,9 @@ void ExhaustNetwork::junctionN(JunctionEnd *ends, int count, Junction &jn) const
     }
 }
 
-void ExhaustNetwork::applyBoundaries() {
-    // the port exchange adds its mass to the first cell directly; the inlet
-    // face itself is closed
-    for (Primary &prim : m_primaries) prim.pipe.applyWallEnd(-1);
+void ExhaustNetwork::applyBoundaries(double dts) {
+    // the ports (the face flux of each primary's inlet, and the port volume's change over the sub-step)
+    for (Primary &prim : m_primaries) portBoundary(prim, dts);
     junctionN(m_junctionEnds.data(), static_cast<int>(m_junctionEnds.size()), m_junction);
     for (size_t q = 1; q < m_collector.size(); ++q) {
         junction2(*m_collector[q - 1], *m_collector[q], m_collectorJunctions[q]);
@@ -418,7 +553,7 @@ void ExhaustNetwork::applyBoundaries() {
         +1, m_params.atmosphericPressure, m_params.atmosphericTemperature, m_atmScalars);
 }
 
-void ExhaustNetwork::step(double dt) {
+void ExhaustNetwork::advance(double dt) {
     if (!m_built || !(dt > 0)) return;
 
     double dxMin = m_collector[0]->cellSize();
@@ -432,9 +567,6 @@ void ExhaustNetwork::step(double dt) {
     // The primitive state is kept current by Pipe1D::advance(); only the
     // initial state after build() or a setCellState() needs computePrimitives().
     while (remaining > 1e-15) {
-        // (the port jet enters the first cell as a source, so its own speed
-        // does not bound the face fluxes; the cell's velocity after the
-        // exchange is already in maxSignalSpeed())
         double smax = 0.0;
         for (Primary &prim : m_primaries) {
             smax = std::max(smax, prim.pipe.maxSignalSpeed());
@@ -445,7 +577,7 @@ void ExhaustNetwork::step(double dt) {
         const double dtCfl = m_params.cfl * dxMin / std::max(smax, 1.0);
         const double dts = std::min(remaining, dtCfl);
 
-        applyBoundaries();
+        applyBoundaries(dts);
         for (Primary &prim : m_primaries) prim.pipe.advance(dts);
         for (Pipe1D *p : m_collector) p->advance(dts);
 
@@ -454,14 +586,27 @@ void ExhaustNetwork::step(double dt) {
         ++subSteps;
         if (subSteps > 10000) break;   // safety against a stalled CFL loop
     }
-    for (Primary &prim : m_primaries) prim.jetSpeed = 0.0;   // diagnostic only
 
-    const double massFlow = outflow / dt;
-    m_outletMassFlowDerivative = (massFlow - m_outletMassFlow) / dt;
+    m_stepOutflow += outflow;
+    m_stepTime += dt;
+    m_stepSubSteps += subSteps;
+}
+
+void ExhaustNetwork::finishStep() {
+    if (!m_built || !(m_stepTime > 0)) return;
+    const double massFlow = m_stepOutflow / m_stepTime;
+    m_outletMassFlowDerivative = (massFlow - m_outletMassFlow) / m_stepTime;
     m_outletMassFlow = massFlow;
-    outlet->setAveragedEndMassFlow(+1, massFlow);
-    m_massOut += outflow;
-    m_lastSubSteps = subSteps;
+    m_collector.back()->setAveragedEndMassFlow(+1, massFlow);
+    m_massOut += m_stepOutflow;
+    m_lastSubSteps = m_stepSubSteps;
+    m_stepOutflow = m_stepTime = 0.0;
+    m_stepSubSteps = 0;
+}
+
+void ExhaustNetwork::step(double dt) {
+    advance(dt);
+    finishStep();
 }
 
 double ExhaustNetwork::outletPressure() const {

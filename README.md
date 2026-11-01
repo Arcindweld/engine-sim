@@ -35,15 +35,24 @@ Parameters on `exhaust_system` / `exhaust_system_parameters`, all optional:
   `megaphone_exit_diameter`, `tailpipe_length`, `tailpipe_diameter`, `pipe_cell_size` (default 4 cm),
   `wall_temperature` (700 K).
 
-Cost: the CPU time scales with `1 / pipe_cell_size^2`. With 4 cm cells a V8 with two 4-1 headers at
-`simulation_frequency: 10000` costs about 2x the lumped model; 2 cm cells about 5x (resolving up to ~2-3 kHz
-instead of ~1-1.5 kHz). Use 6 cm on a slow machine, 2 cm when the torque numbers matter.
+Each cylinder's exhaust-port volume feeds its primary through a characteristic (valve-type) boundary solved
+with the pipe, and the pipes advance after every fluid sub-step of the engine, so the torque converges with
+the cell size and the simulation frequency: the test inline-4 at 6000 rpm makes 141 / 138 / 137 / 137 N m on
+4 / 2 / 1 / 0.5 cm cells and 138 / 138 / 140 N m at 15 / 20 / 40 kHz, against a spread of 3-3.5 N m between
+seeds of the combustion model's random burn, and 4 cm and 2 cm cells agree within 4% at 4000-7800 rpm
+(`docs/exhaust-1d.md`, sections 2.4 and 6).
 
-Known limits: the torque above about 6000 rpm depends on the cell size (2 cm and 4 cm can differ by 10-20%
-there; 2 cm is the smoother result); 4-1 headers show a low-rpm torque hole that is real but exaggerated
-(no junction losses, lumped intake runner, fixed wall temperature); the per-cylinder `sound_attenuation` is
-not applied to 1-D systems; cones are linear tapers, there are no crossovers, mufflers or catalysts (the
-impulse response still does that).
+Cost: a V8 with two 4-1 headers at `simulation_frequency: 10000` costs about 6x the lumped model with the
+default 4 cm cells and 9x with 2 cm cells (2 cm resolves up to ~2-3 kHz instead of ~1-1.5 kHz). engine-sim
+itself needs a simulation step of no more than about 2 degrees of crank at the highest rpm used (both exhaust
+models lose torque beyond that: the inline-4 at 6000 rpm made a third less at 10 kHz, 3.6 degrees per step);
+the calculator's fork exports set the frequency to 3 x redline for that reason.
+
+Known limits: 4-1 headers show a low-rpm torque hole that is real but exaggerated (no junction losses, lumped
+intake runner, fixed wall temperature; at 4000 rpm the neighbour's blowdown pulse reaches the port at 1.5 bar
+during overlap and pushes exhaust through the cylinder into the lumped intake runner); the per-cylinder
+`sound_attenuation` is not applied to 1-D systems; cones are linear tapers, there are no crossovers, mufflers
+or catalysts (the impulse response still does that).
 
 ## Downloads
 
