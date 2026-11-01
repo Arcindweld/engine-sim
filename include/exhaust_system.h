@@ -56,7 +56,7 @@ class ExhaustSystem : public Part {
         virtual void destroy();
 
         // Legacy model: one lumped volume step at the fluid sub-step rate.
-        // 1-D model: no-op (see processNetwork).
+        // 1-D model: no-op (see advanceNetwork / finishNetworkStep).
         void process(double dt);
 
         // 1-D model ---------------------------------------------------------
@@ -67,11 +67,14 @@ class ExhaustSystem : public Part {
         int attachPrimary(GasSystem *port, double length, double portArea, double kFlow);
         void buildNetwork();
         inline bool isNetworkBuilt() const { return m_network.isBuilt(); }
-        // Per fluid sub-step, called by the cylinder in place of the lumped primary -> collector flow
-        void exchangePort(int primaryIndex, double dt);
-        // Once per simulation step
+        // Per fluid sub-step, after the cylinders flowed into their ports: advance the pipes (each pipe
+        // sub-step solves the port boundaries, which move gas between the ports and the primaries)
+        void advanceNetwork(double dt);
+        // Once per simulation step: close the step (outlet flow, sound source) and mirror the outlet state
+        void finishNetworkStep(double dt);
+        // Both at once, for an exhaust driven on its own (tests, tools)
         void processNetwork(double dt);
-        // Monopole source at the open end (Pa at 1 m), from the last processNetwork
+        // Monopole source at the open end (Pa at 1 m), over the last closed step
         inline double getOutletSoundSource() const { return m_network.radiatedPressure(); }
         inline ExhaustNetwork *getNetwork() { return &m_network; }
         inline const ExhaustNetwork *getNetwork() const { return &m_network; }

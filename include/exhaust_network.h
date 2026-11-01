@@ -7,11 +7,12 @@
 // Coupling to the rest of engine-sim: each primary's inlet is fed from the
 // cylinder's exhaust-port GasSystem (the lumped runner volume that the cylinder
 // already flows into) through a compressible orifice whose effective area is
-// derived from the script's `primary_flow_rate`.  The port exchange runs at the
-// fluid sub-step rate and updates the port volume and the pipe's first cell
-// at once; the pipes then advance once per simulation step with their own
-// CFL sub-stepping.  Mass and energy that leave a port GasSystem arrive in the
-// pipe exactly.
+// derived from the script's `primary_flow_rate`.  The network advances after
+// every fluid sub-step of the engine (CFL sub-stepped inside); every pipe
+// sub-step first solves each port boundary at the primary's inlet face (orifice
+// flow matched to the pipe's incoming characteristic) and moves the same mass,
+// enthalpy and species between the port volume and the pipe, so what leaves a
+// port GasSystem arrives in the pipe exactly.
 
 #ifndef ATG_ENGINE_SIM_EXHAUST_NETWORK_H
 #define ATG_ENGINE_SIM_EXHAUST_NETWORK_H
@@ -47,8 +48,8 @@ class ExhaustNetwork {
         struct Primary {
             PrimarySpec spec;
             Pipe1D pipe;
-            double jetSpeed;         // largest jet speed seen since the last step
-            double lastMassFlow;     // kg/s into the pipe, last exchange
+            double lastMassFlow;     // kg/s into the pipe, last sub-step
+            double facePressure;     // last solution at the inlet face, the next solve's start
         };
 
         struct Junction {
@@ -58,14 +59,22 @@ class ExhaustNetwork {
     public:
         ExhaustNetwork();
         ~ExhaustNetwork();
+        // owns the collector pipes through raw pointers: not copyable
+        ExhaustNetwork(const ExhaustNetwork &) = delete;
+        ExhaustNetwork &operator=(const ExhaustNetwork &) = delete;
 
         int addPrimary(const PrimarySpec &spec);
         void build(const Parameters &params);
         inline bool isBuilt() const { return m_built; }
 
-        // Per fluid sub-step: move gas between the port GasSystem and the pipe end.
-        void exchangePort(int primary, double dt);
-        // Once per simulation step.
+        // Per fluid sub-step, after the cylinders flowed into their ports: advance the pipes by dt (CFL
+        // sub-stepped inside). Each sub-step solves the port boundaries first: the flow between each port
+        // GasSystem and its primary's inlet face, which updates the port volume by the same flux.
+        void advance(double dt);
+        // Once per simulation step: the outlet flow averaged over the step's advances, its derivative (the
+        // radiated sound) and the mass account.
+        void finishStep();
+        // advance(dt) then finishStep(), for a network driven on its own (tests, tools)
         void step(double dt);
 
         // Outlet (open end) quantities, averaged over the last step
@@ -84,6 +93,8 @@ class ExhaustNetwork {
         inline double massOut() const { return m_massOut; }     // through the open end, net out
         inline double initialMass() const { return m_initialMass; }
         inline int lastSubSteps() const { return m_lastSubSteps; }
+        // kg/s through port i in the last sub-step, positive into the pipe
+        inline double portMassFlow(int i) const { return m_primaries[i].lastMassFlow; }
         int cellCount() const;
 
         inline int primaryCount() const { return static_cast<int>(m_primaries.size()); }
@@ -97,7 +108,6 @@ class ExhaustNetwork {
 
         // Compressible orifice mass flow (kg/s) from stagnation (p0, T0) to pd
         double orificeFlow(double CdA, double p0, double T0, double pd) const;
-        double jetSpeed(double p0, double T0, double pd) const;
 
         // Characteristic junctions (exposed for tests)
         // Two pipes meeting end to end: a's right end to b's left end.
@@ -109,7 +119,11 @@ class ExhaustNetwork {
         void junctionN(JunctionEnd *ends, int count, Junction &j) const;
 
     private:
-        void applyBoundaries();
+        void portBoundary(Primary &prim, double dts);
+        void portFace(const Primary &prim, const GasSystem *port, double dts, double guess, double *flux,
+                      double *facePressure) const;
+        void applyPortFlux(GasSystem &port, const double *flux, double dt) const;
+        void applyBoundaries(double dts);
         double gammaValue() const { return m_gamma; }
 
     private:
@@ -129,6 +143,9 @@ class ExhaustNetwork {
         double m_outletMassFlowDerivative;
         double m_massIn, m_massOut, m_initialMass;
         int m_lastSubSteps;
+        // accumulated by advance() over the current simulation step
+        double m_stepOutflow, m_stepTime;
+        int m_stepSubSteps;
 };
 
 #endif /* ATG_ENGINE_SIM_EXHAUST_NETWORK_H */
