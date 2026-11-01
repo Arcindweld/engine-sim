@@ -52,6 +52,18 @@ jobs:
         run: |
           cmake --build build --config ${{ env.BUILD_TYPE }} --target engine-sim-app
           cmake --build build --config ${{ env.BUILD_TYPE }} --target engine-sim-headless
+          cmake --build build --config ${{ env.BUILD_TYPE }} --target engine-sim-test
+
+      # the 1-D exhaust's unit and network tests (Sod and blowdown shock tubes against the exact solution, junctions,
+      # port boundary conservation and convergence). Upstream's own gas-system, function and synthesizer tests fail,
+      # crash or hang on this tree, as on the exhaust-1d head before it (docs/exhaust-1d.md, section 4), so they are
+      # left out here.
+      - name: 1-D exhaust tests
+        shell: pwsh
+        run: |
+          $t = Get-ChildItem -Recurse -Filter engine-sim-test.exe build | Select-Object -First 1
+          & $t.FullName --gtest_filter='Pipe1DTests.*:ExhaustNetworkTests.*'
+          if ($LASTEXITCODE -ne 0) { throw "1-D exhaust tests failed: $LASTEXITCODE" }
 
       - name: Package
         shell: pwsh
@@ -88,6 +100,27 @@ jobs:
           Pop-Location
           Get-Content package/smoke.json -Raw
           "{0:N0} bytes of sound" -f (Get-Item package/smoke.wav).Length
+
+      # the 1-D exhaust on the calculator's test engine (test/data/exhaust_tuner_i4.mr, a 4-1 header): it must pick the
+      # 1-D model, run without NaN, make torque and keep its mass account
+      - name: Headless 1-D smoke test
+        shell: pwsh
+        run: |
+          Copy-Item test/data/exhaust_tuner_i4.mr package/engine-sim-arcindweld/smoke_i4.mr
+          Push-Location package/engine-sim-arcindweld
+          & bin/engine-sim-headless.exe smoke_i4.mr --sim 3 --hold-rpm 6000 --no-audio --json ../smoke1d.json
+          $rc = $LASTEXITCODE
+          Remove-Item smoke_i4.mr
+          Pop-Location
+          if ($rc -ne 0) { throw "headless 1-D run failed: $rc" }
+          $j = Get-Content package/smoke1d.json -Raw | ConvertFrom-Json
+          if ($j.exhaust[0].legacy) { throw "the test engine ran the legacy exhaust" }
+          if ($j.sim.nan) { throw "NaN in the 1-D run" }
+          if ($j.sim.mean_dyno_torque_Nm -lt 50) { throw ("1-D torque too low: {0} N m" -f $j.sim.mean_dyno_torque_Nm) }
+          foreach ($m in $j.sim.mass) {
+            if ($m -and [math]::Abs($m.error_rel_to_throughput) -gt 1e-6) { throw ("1-D mass account off: {0}" -f $m.error_rel_to_throughput) }
+          }
+          "1-D: {0:N1} N m at {1:N0} rpm on {2} cells" -f $j.sim.mean_dyno_torque_Nm, $j.sim.mean_rpm, $j.total_cells
 
       - uses: actions/upload-artifact@v4
         with:

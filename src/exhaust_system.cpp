@@ -170,15 +170,21 @@ void ExhaustSystem::buildNetwork() {
     m_network.build(np);
 }
 
-void ExhaustSystem::exchangePort(int primaryIndex, double dt) {
+void ExhaustSystem::advanceNetwork(double dt) {
+    if (m_legacy) return;
     if (!m_network.isBuilt()) buildNetwork();
-    m_network.exchangePort(primaryIndex, dt);
+    m_network.advance(dt);
 }
 
 void ExhaustSystem::processNetwork(double dt) {
+    advanceNetwork(dt);
+    finishNetworkStep(dt);
+}
+
+void ExhaustSystem::finishNetworkStep(double dt) {
     if (m_legacy) return;
     if (!m_network.isBuilt()) buildNetwork();
-    m_network.step(dt);
+    m_network.finishStep();
 
     // Mirror the outlet state into the legacy GasSystem so that readers of
     // getSystem() (exhaust O2 gauge, average output signal) keep working.

@@ -9,6 +9,7 @@
 #include "../include/gas_system.h"
 #include "../include/units.h"
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <vector>
@@ -35,6 +36,130 @@ Pipe1D::Parameters straightPipe(double length, double diameter, double cellSize)
 
 double cflStep(const Pipe1D &pipe) {
     return 0.8 * pipe.cellSize() / pipe.maxSignalSpeed();
+}
+
+// A transmissive (non-reflecting for these tests) end: the face flux is the Euler flux of the end cell itself.
+void transmissiveEnd(Pipe1D &pipe, int side) {
+    const Pipe1D::State st = pipe.state(pipe.endCell(side));
+    double F[Pipe1D::FluxCount];
+    pipe.hllc(st, st, F);
+    for (int k = 0; k < Pipe1D::FluxCount; ++k) F[k] *= pipe.endFaceArea(side);
+    pipe.setEndFlux(side, F);
+}
+
+// Exact solution of the Riemann problem for an ideal gas (Toro, Riemann Solvers and Numerical Methods for Fluid
+// Dynamics, 3rd ed., 2009, ch. 4): the pressure functions f_K and their derivatives, Newton for the star pressure,
+// and the wave pattern sampled at S = x / t.
+struct Prim { double r, u, p; };
+
+double pressureFunction(double p, const Prim &K, double g, double *derivative) {
+    const double c = std::sqrt(g * K.p / K.r);
+    if (p > K.p) {   // shock
+        const double A = 2 / ((g + 1) * K.r), B = (g - 1) / (g + 1) * K.p;
+        const double q = std::sqrt(A / (p + B));
+        *derivative = q * (1 - 0.5 * (p - K.p) / (B + p));
+        return (p - K.p) * q;
+    }
+    const double pr = p / K.p;   // rarefaction
+    *derivative = 1 / (K.r * c) * std::pow(pr, -(g + 1) / (2 * g));
+    return 2 * c / (g - 1) * (std::pow(pr, (g - 1) / (2 * g)) - 1);
+}
+
+void starState(const Prim &L, const Prim &R, double g, double *pStar, double *uStar) {
+    double p = 0.5 * (L.p + R.p), dL, dR;
+    for (int it = 0; it < 100; ++it) {
+        const double f = pressureFunction(p, L, g, &dL) + pressureFunction(p, R, g, &dR) + R.u - L.u;
+        const double next = std::max(1e-12, p - f / (dL + dR));
+        const bool done = std::fabs(next - p) < 1e-14 * p;
+        p = next;
+        if (done) break;
+    }
+    *pStar = p;
+    *uStar = 0.5 * (L.u + R.u) + 0.5 * (pressureFunction(p, R, g, &dR) - pressureFunction(p, L, g, &dL));
+}
+
+Prim sampleExact(const Prim &L, const Prim &R, double g, double S) {
+    double p, u;
+    starState(L, R, g, &p, &u);
+    const double cL = std::sqrt(g * L.p / L.r), cR = std::sqrt(g * R.p / R.r);
+    const double gm = (g - 1) / (g + 1);
+    if (S <= u) {
+        if (p > L.p) {
+            const double SL = L.u - cL * std::sqrt((g + 1) / (2 * g) * p / L.p + (g - 1) / (2 * g));
+            if (S <= SL) return L;
+            return { L.r * (p / L.p + gm) / (gm * p / L.p + 1), u, p };
+        }
+        const double head = L.u - cL, tail = u - cL * std::pow(p / L.p, (g - 1) / (2 * g));
+        if (S <= head) return L;
+        if (S >= tail) return { L.r * std::pow(p / L.p, 1 / g), u, p };
+        const double k = 2 / (g + 1) + gm / cL * (L.u - S);
+        return { L.r * std::pow(k, 2 / (g - 1)), 2 / (g + 1) * (cL + (g - 1) / 2 * L.u + S),
+                 L.p * std::pow(k, 2 * g / (g - 1)) };
+    }
+    if (p > R.p) {
+        const double SR = R.u + cR * std::sqrt((g + 1) / (2 * g) * p / R.p + (g - 1) / (2 * g));
+        if (S >= SR) return R;
+        return { R.r * (p / R.p + gm) / (gm * p / R.p + 1), u, p };
+    }
+    const double head = R.u + cR, tail = u + cR * std::pow(p / R.p, (g - 1) / (2 * g));
+    if (S >= head) return R;
+    if (S <= tail) return { R.r * std::pow(p / R.p, 1 / g), u, p };
+    const double k = 2 / (g + 1) - gm / cR * (R.u - S);
+    return { R.r * std::pow(k, 2 / (g - 1)), 2 / (g + 1) * (-cR + (g - 1) / 2 * R.u + S),
+             R.p * std::pow(k, 2 * g / (g - 1)) };
+}
+
+struct ShockTube {
+    double l1Rho, l1P, l1U;        // L1 errors relative to the L1 norm of the exact rho, p and max |u|
+    double plateauP, pStar;        // mean computed pressure inside the star region, and the exact p*
+    double massDrift;
+};
+
+// A 1 m tube (no friction, no heat transfer) split at 0.5 m, run to tEnd on n cells; the waves stay clear of the
+// ends, which are transmissive.
+ShockTube runShockTube(const Prim &L, const Prim &R, double tEnd, int n) {
+    const double g = 1.4, x0 = 0.5;
+    Pipe1D::Parameters pp = straightPipe(1.0, 0.05, 1.0 / n);
+    pp.frictionFactor = 0.0;
+    Pipe1D pipe;
+    pipe.initialize(pp);
+    for (int i = 0; i < pipe.cellCount(); ++i) {
+        const Prim &w = (i + 0.5) * pipe.cellSize() < x0 ? L : R;
+        pipe.setCellState(i, w.r, w.u, w.p, AtmScalars);
+    }
+    pipe.computePrimitives();
+    const double m0 = pipe.totalMass();
+    double t = 0;
+    while (t < tEnd - 1e-15) {
+        transmissiveEnd(pipe, -1);
+        transmissiveEnd(pipe, +1);
+        const double dt = std::min(cflStep(pipe), tEnd - t);
+        pipe.advance(dt);
+        t += dt;
+    }
+    ShockTube res{};
+    double pStar, uStar, rhoRef = 0, pRef = 0, uRef = 1e-30;
+    starState(L, R, g, &pStar, &uStar);
+    std::vector<int> plateau;
+    for (int i = 0; i < pipe.cellCount(); ++i) {
+        const Prim e = sampleExact(L, R, g, ((i + 0.5) * pipe.cellSize() - x0) / t);
+        res.l1Rho += std::fabs(pipe.density(i) - e.r);
+        res.l1P += std::fabs(pipe.pressure(i) - e.p);
+        res.l1U += std::fabs(pipe.velocity(i) - e.u);
+        rhoRef += e.r; pRef += e.p; uRef = std::max(uRef, std::fabs(e.u));
+        if (std::fabs(e.p - pStar) < 1e-9 * pStar) plateau.push_back(i);
+    }
+    res.l1Rho /= rhoRef;
+    res.l1P /= pRef;
+    res.l1U /= uRef * pipe.cellCount();
+    // the star region without the cells next to its edges (the captured waves are a few cells wide)
+    double sum = 0;
+    int count = 0;
+    for (size_t k = 4; k + 4 < plateau.size(); ++k) { sum += pipe.pressure(plateau[k]); ++count; }
+    res.plateauP = count > 0 ? sum / count : 0;
+    res.pStar = pStar;
+    res.massDrift = (pipe.totalMass() - m0) / m0;
+    return res;
 }
 
 } // namespace
@@ -240,14 +365,132 @@ TEST(Pipe1DTests, JunctionPressureAndMassBalance) {
     EXPECT_NEAR(peakB, peakC, 0.03 * peakA);
 }
 
-// Orifice flow sanity: choked mass flow of air through 1 cm^2 at 2 bar, 300 K
-// m = Cd A p0 sqrt(gamma / (R T0)) (2/(gamma+1))^((gamma+1)/(2(gamma-1)))
+// Orifice flow of air through 1 cm^2 from 2 bar, 300 K (isentropic nozzle, e.g. Anderson, Modern Compressible
+// Flow, ch. 5): choked below the critical pressure ratio, m = A p0 sqrt(g / (R T0)) (2/(g+1))^((g+1)/(2(g-1))),
+// and subsonic above it, m = A p0 sqrt(2 g / ((g-1) R T0) (pr^(2/g) - pr^((g+1)/g))). The two meet at the
+// critical ratio, the flow falls to zero as the pressures equalise, and nothing flows against the pressure drop.
+// The gas is the network's after build(): gamma = 1 + 2 / 5, R = R_u / M of air.
 TEST(Pipe1DTests, OrificeChokedFlow) {
     ExhaustNetwork net;
+    GasSystem port;
+    port.initialize(Patm, 1e-4, Tatm);
+    ExhaustNetwork::PrimarySpec spec;
+    spec.port = &port;
+    spec.length = 0.3;
+    spec.diameter = 0.04;
+    net.addPrimary(spec);
+    net.build(ExhaustNetwork::Parameters());
+
     const double g = 1.4, R = 8.31446261815324 / 0.02897;
     const double p0 = 2e5, T0 = 300.0, A = 1e-4;
-    const double expected = A * p0 * std::sqrt(g / (R * T0)) * std::pow(2 / (g + 1), (g + 1) / (2 * (g - 1)));
-    EXPECT_NEAR(net.orificeFlow(A, p0, T0, Patm), expected, 1e-4 * expected);
-    EXPECT_NEAR(net.orificeFlow(A, p0, T0, 0.9 * p0), net.orificeFlow(A, p0, T0, 0.9 * p0), 0.0);
+    const double choked = A * p0 * std::sqrt(g / (R * T0)) * std::pow(2 / (g + 1), (g + 1) / (2 * (g - 1)));
+    auto subsonic = [&](double pr) {
+        return A * p0 * std::sqrt(2 * g / ((g - 1) * R * T0) * (std::pow(pr, 2 / g) - std::pow(pr, (g + 1) / g)));
+    };
+    const double prc = std::pow(2 / (g + 1), g / (g - 1));   // 0.528
+    EXPECT_NEAR(net.orificeFlow(A, p0, T0, Patm), choked, 1e-9 * choked);
+    EXPECT_NEAR(net.orificeFlow(A, p0, T0, 0.2 * p0), choked, 1e-9 * choked);
+    for (double pr : { 0.6, 0.8, 0.9, 0.99 }) {
+        EXPECT_NEAR(net.orificeFlow(A, p0, T0, pr * p0), subsonic(pr), 1e-9 * choked) << "pr " << pr;
+    }
+    EXPECT_NEAR(subsonic(prc), choked, 1e-9 * choked);   // the formulas agree at the critical ratio
+    EXPECT_NEAR(net.orificeFlow(A, p0, T0, prc * p0 * (1 + 1e-9)), choked, 1e-6 * choked);
+    double last = choked;
+    for (double pr = 0.53; pr < 1.0; pr += 0.01) {
+        const double m = net.orificeFlow(A, p0, T0, pr * p0);
+        EXPECT_LT(m, last) << "pr " << pr;
+        last = m;
+    }
+    EXPECT_EQ(net.orificeFlow(A, p0, T0, p0), 0.0);
     EXPECT_EQ(net.orificeFlow(A, Patm, T0, p0), 0.0);
+}
+
+// (h) Sod's shock tube (Sod, J. Comput. Phys. 27, 1978; here 1 / 0.125 kg/m3 and 1e5 / 1e4 Pa) and an exhaust
+// blowdown (5 bar 1200 K into 1 bar 300 K) against the exact Riemann solution: the L1 errors are small on 400
+// cells and fall as the grid is refined, the pressure between the rarefaction and the shock is the exact p*,
+// and no mass is lost.
+TEST(Pipe1DTests, ShockTubesMatchTheExactSolution) {
+    struct Case { const char *name; Prim L, R; double tEnd, maxL1Rho, maxL1P; };
+    const double Rg = 287.0;
+    const Case cases[] = {
+        { "Sod", { 1.0, 0, 1e5 }, { 0.125, 0, 1e4 }, 0.5e-3, 0.006, 0.005 },
+        { "blowdown", { 5e5 / (Rg * 1200), 0, 5e5 }, { 1e5 / (Rg * 300), 0, 1e5 }, 0.4e-3, 0.015, 0.005 },
+    };
+    for (const Case &c : cases) {
+        const ShockTube coarse = runShockTube(c.L, c.R, c.tEnd, 100);
+        const ShockTube fine = runShockTube(c.L, c.R, c.tEnd, 400);
+        std::cout << "[  values  ] " << c.name << ": L1 rho " << 100 * coarse.l1Rho << " % (100 cells) -> "
+                  << 100 * fine.l1Rho << " % (400), p " << 100 * fine.l1P << " %, u " << 100 * fine.l1U
+                  << " %; star p " << fine.plateauP << " Pa, exact " << fine.pStar << " Pa\n";
+        EXPECT_LT(fine.l1Rho, c.maxL1Rho) << c.name;
+        EXPECT_LT(fine.l1P, c.maxL1P) << c.name;
+        EXPECT_LT(fine.l1Rho, 0.5 * coarse.l1Rho) << c.name;
+        EXPECT_LT(fine.l1P, 0.5 * coarse.l1P) << c.name;
+        EXPECT_NEAR(fine.plateauP, fine.pStar, 0.002 * fine.pStar) << c.name;
+        EXPECT_NEAR(fine.massDrift, 0.0, 1e-12) << c.name;
+    }
+}
+
+// (i) A temperature front (900 K gas meeting 300 K gas at the same pressure and velocity) carried through a
+// junction. The exact answer is that only the temperature moves: pressure and velocity stay uniform. The
+// junction hands each receiving pipe the arriving gas's own state; giving the receiving end its own density (the
+// first version of the solver) put 6.5 kPa (flow one way) and 10 kPa (the other) pressure steps here, about half
+// of rho c u. Two pipes through junction2, the same through a two-ended junctionN, and two primaries meeting a
+// collector of their combined area (the mixing path), each with the flow both ways.
+TEST(Pipe1DTests, TemperatureFrontCrossesJunctionsUndisturbed) {
+    const double dx = 0.01, d = 0.04, tEnd = 1.0e-3, Rg = 287.0, Thot = 900.0, Tcold = 300.0;
+    auto fill = [&](Pipe1D &p, double T, double u) {
+        for (int i = 0; i < p.cellCount(); ++i) p.setCellState(i, Patm / (Rg * T), u, Patm, AtmScalars);
+        p.computePrimitives();
+    };
+    auto makePipe = [&](Pipe1D &p, double diameter) {
+        Pipe1D::Parameters pp = straightPipe(1.0, diameter, dx);
+        pp.frictionFactor = 0.0;
+        p.initialize(pp);
+    };
+    ExhaustNetwork net;   // only its junction solvers are used here (gamma 1.4, R 287 before build())
+    for (int layout = 0; layout < 3; ++layout) {
+        for (double u : { 50.0, -50.0 }) {
+            Pipe1D a, b, c;
+            makePipe(a, d);
+            makePipe(b, d);
+            makePipe(c, layout == 2 ? d * std::sqrt(2.0) : d);
+            fill(a, Thot, u);
+            fill(b, layout == 2 ? Thot : Tcold, u);
+            fill(c, Tcold, u);
+            ExhaustNetwork::Junction jn;
+            ExhaustNetwork::JunctionEnd two[2] = { { &a, +1 }, { &c, -1 } };
+            ExhaustNetwork::JunctionEnd three[3] = { { &a, +1 }, { &b, +1 }, { &c, -1 } };
+            std::vector<Pipe1D *> pipes = { &a, &c };
+            if (layout == 2) pipes.push_back(&b);
+            double t = 0, dpMax = 0, duMax = 0;
+            while (t < tEnd) {
+                for (Pipe1D *q : pipes) transmissiveEnd(*q, q == &c ? +1 : -1);
+                if (layout == 0) net.junction2(a, c, jn);
+                else if (layout == 1) net.junctionN(two, 2, jn);
+                else net.junctionN(three, 3, jn);
+                double s = 0;
+                for (Pipe1D *q : pipes) s = std::max(s, q->maxSignalSpeed());
+                const double dt = std::min(0.8 * dx / s, tEnd - t);
+                for (Pipe1D *q : pipes) q->advance(dt);
+                t += dt;
+                for (Pipe1D *q : pipes) {
+                    for (int i = 0; i < q->cellCount(); ++i) {
+                        dpMax = std::max(dpMax, std::fabs(q->pressure(i) - Patm));
+                        duMax = std::max(duMax, std::fabs(q->velocity(i) - u));
+                    }
+                }
+            }
+            const char *names[3] = { "junction2", "junctionN, 2 ends", "junctionN, 2 primaries + collector" };
+            std::cout << "[  values  ] " << names[layout] << ", u " << u << " m/s: max |p - p0| " << dpMax
+                      << " Pa, max |u - u0| " << duMax << " m/s\n";
+            EXPECT_LT(dpMax, 1.0) << names[layout] << ", u " << u;
+            EXPECT_LT(duMax, 0.01) << names[layout] << ", u " << u;
+            // the front really crossed: the receiving pipe's first cells changed temperature
+            const Pipe1D &recv = u > 0 ? c : a;
+            const int cell = u > 0 ? 0 : a.cellCount() - 1;
+            const double Tarriving = u > 0 ? Thot : Tcold;
+            EXPECT_NEAR(recv.temperature(cell), Tarriving, 0.05 * Tarriving) << names[layout] << ", u " << u;
+        }
+    }
 }

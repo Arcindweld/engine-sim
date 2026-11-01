@@ -33,7 +33,7 @@ struct RunResult {
     bool compiled = false;
     bool nan = false;
     bool started = false;
-    double meanTorque = 0.0;     // N m, dyno hold, last 0.5 s
+    double meanTorque = 0.0;     // N m, dyno hold, mean over the last `average` seconds
     double meanRpm = 0.0;
     int cells = 0;
     double massImbalance = 0.0;  // relative to the throughput, 1-D systems only
@@ -41,8 +41,9 @@ struct RunResult {
 };
 
 // Compile a script, crank it for up to `crank` seconds at WOT, then hold it on
-// the dyno at `holdRpm` for `hold` seconds.
-RunResult runScript(const std::string &path, double crank, double holdRpm, double hold) {
+// the dyno at `holdRpm` for `hold` seconds; torque and rpm are averaged over the
+// last `average` seconds.
+RunResult runScript(const std::string &path, double crank, double holdRpm, double hold, double average = 0.5) {
     RunResult res;
     std::srand(12345);
     es_script::Compiler compiler;
@@ -114,7 +115,7 @@ RunResult runScript(const std::string &path, double crank, double holdRpm, doubl
             ExhaustSystem *ex = engine->getExhaustSystem(e);
             if (!ex->isLegacy() && std::isnan(ex->getNetwork()->totalMass())) res.nan = true;
         }
-        if (res.started && t > tStart + hold - 0.5) {
+        if (res.started && t > tStart + hold - average) {
             torqueSum += torque;
             rpmSum += rpm;
             ++nAvg;
@@ -372,37 +373,48 @@ TEST_F(EngineTests, LegacyModeKeepsLumpedModel) {
     std::remove("test_legacy_engine_tmp.mr");
 }
 
-// Physics check: primary length changes the torque of the 1-D model (header
-// tuning) but not that of the legacy model beyond its small volume effect.
-// Uses the 2.0 L inline-4 with a 4-1 header (721 mm primaries, 44 mm) from
-// test/data, held at 6000 rpm, with the primaries 10% shorter and 10% longer.
+// Physics check: primary length changes the torque of the 1-D model (header tuning) but not that of the legacy
+// model beyond its small volume effect, and the tuning is the solution's, not the grid's: the 2.0 L inline-4 with a
+// 4-1 header (721 mm primaries, 44 mm) from test/data, held at 6000 rpm, with the primaries 10% shorter and 10%
+// longer, on the default 4 cm cells and on 2 cm cells. Both grids give the same torque within 8% and the same
+// change with length within a third. (With the first, cell-source port coupling the two grids disagreed in sign
+// for the same change: 180.7 -> 157.2 N m at 4 cm, 170.6 -> 185.6 N m at 2 cm.)
 TEST_F(EngineTests, PrimaryLengthTunesOnlyTheOneDModel) {
     const std::string base = readFile("test/data/exhaust_tuner_i4.mr");
     const std::string key = "primary_tube_length: 720.969 * units.mm";
     ASSERT_NE(base.find(key), std::string::npos) << "test data changed; update the test";
 
-    auto torqueFor = [&](const std::string &engineText, const char *tag) {
-        const std::string path = std::string("test_tune_") + tag + ".mr";
+    auto torqueFor = [&](const std::string &engineText, const std::string &tag) {
+        const std::string path = "test_tune_" + tag + ".mr";
         std::ofstream(path) << engineText;     // the file defines and calls main()
-        const RunResult r = runScript(path, 2.0, 6000.0, 2.0);
+        // 1.5 s averaged (75 cycles): the combustion model's cycle-to-cycle scatter moves a 0.5 s mean by 1-2 %
+        const RunResult r = runScript(path, 2.0, 6000.0, 2.5, 1.5);
         std::remove(path.c_str());
         EXPECT_TRUE(r.compiled && r.started && !r.nan) << tag;
         return r.meanTorque;
     };
 
-    double tq1d[2], tqLegacy[2];
+    double tq4[2], tq2[2], tqLegacy[2];
     const char *lengths[2] = { "primary_tube_length: 648.87 * units.mm", "primary_tube_length: 793.07 * units.mm" };
     for (int i = 0; i < 2; ++i) {
         std::string s = base;
         s.replace(s.find(key), key.size(), lengths[i]);
-        tq1d[i] = torqueFor(s, i == 0 ? "short" : "long");
-        tqLegacy[i] = torqueFor(legacyVariant(s), i == 0 ? "short_legacy" : "long_legacy");
+        const std::string tag = i == 0 ? "short" : "long";
+        tq4[i] = torqueFor(s, tag);
+        tq2[i] = torqueFor(withExhaustInput(s, "pipe_cell_size: 2 * units.cm"), tag + "_2cm");
+        tqLegacy[i] = torqueFor(legacyVariant(s), tag + "_legacy");
     }
-    const double change1d = std::fabs(tq1d[1] - tq1d[0]) / std::max(std::fabs(tq1d[0]), 1.0);
+    const double d4 = tq4[1] - tq4[0], d2 = tq2[1] - tq2[0];
+    const double change4 = std::fabs(d4) / std::max(std::fabs(tq4[0]), 1.0);
+    const double change2 = std::fabs(d2) / std::max(std::fabs(tq2[0]), 1.0);
     const double changeLegacy = std::fabs(tqLegacy[1] - tqLegacy[0]) / std::max(std::fabs(tqLegacy[0]), 1.0);
-    std::cout << "[  values  ] 6000 rpm, primaries -10% / +10%: 1-D " << tq1d[0] << " / " << tq1d[1]
-              << " N m (" << 100 * change1d << " %), legacy " << tqLegacy[0] << " / " << tqLegacy[1]
-              << " N m (" << 100 * changeLegacy << " %)\n";
-    EXPECT_GT(change1d, 0.05);
+    std::cout << "[  values  ] 6000 rpm, primaries -10% / +10%: 1-D 4 cm " << tq4[0] << " / " << tq4[1]
+              << " N m (" << 100 * change4 << " %), 2 cm " << tq2[0] << " / " << tq2[1] << " N m (" << 100 * change2
+              << " %), legacy " << tqLegacy[0] << " / " << tqLegacy[1] << " N m (" << 100 * changeLegacy << " %)\n";
+    EXPECT_GT(change4, 0.05);
+    EXPECT_GT(change2, 0.05);
     EXPECT_LT(changeLegacy, 0.03);
+    for (int i = 0; i < 2; ++i) EXPECT_NEAR(tq4[i], tq2[i], 0.08 * std::fabs(tq2[i])) << (i == 0 ? "short" : "long");
+    EXPECT_GT(d4 * d2, 0.0) << "the two grids disagree on the direction of the change";
+    EXPECT_NEAR(d4, d2, std::fabs(d2) / 3) << "the two grids disagree on the size of the change";
 }

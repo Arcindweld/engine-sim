@@ -318,10 +318,8 @@ void CombustionChamber::flow(double dt) {
         flowParams.system_1 = exhaust->getSystem();
         GasSystem::flow(flowParams);
     }
-    else {
-        // port volume <-> first cell of this cylinder's primary pipe
-        exhaust->exchangePort(m_exhaustPrimaryIndex, dt);
-    }
+    // 1-D model: the port volume exchanges with its primary pipe inside ExhaustSystem::advanceNetwork(), which
+    // the simulator calls after every cylinder has flowed (the port boundary is solved with the pipe)
 
     m_intakeRunnerAndManifold.updateVelocity(dt, intake->getVelocityDecay());
     m_system.updateVelocity(dt, 0.5);
