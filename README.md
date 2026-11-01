@@ -38,8 +38,8 @@ Parameters on `exhaust_system` / `exhaust_system_parameters`, all optional:
 Each cylinder's exhaust-port volume feeds its primary through a characteristic (valve-type) boundary solved
 with the pipe, and the pipes advance after every fluid sub-step of the engine, so the torque converges with
 the cell size and the simulation frequency: the test inline-4 at 6000 rpm makes 141 / 138 / 137 / 137 N m on
-4 / 2 / 1 / 0.5 cm cells and 138 / 138 / 140 N m at 15 / 20 / 40 kHz, against a scatter of about 2 N m from
-the combustion model's random burn, and 4 cm and 2 cm cells agree within 4% at 4000-7800 rpm
+4 / 2 / 1 / 0.5 cm cells and 138 / 138 / 140 N m at 15 / 20 / 40 kHz, against a spread of 3-3.5 N m between
+seeds of the combustion model's random burn, and 4 cm and 2 cm cells agree within 4% at 4000-7800 rpm
 (`docs/exhaust-1d.md`, sections 2.4 and 6).
 
 Cost: a V8 with two 4-1 headers at `simulation_frequency: 10000` costs about 6x the lumped model with the
