@@ -36,14 +36,15 @@ Parameters on `exhaust_system` / `exhaust_system_parameters`, all optional:
   `wall_temperature` (700 K).
 
 Each cylinder's exhaust-port volume feeds its primary through a characteristic (valve-type) boundary solved
-with the pipe, and the pipes advance after every fluid sub-step of the engine, so the torque converges with
-the cell size and the simulation frequency: the test inline-4 at 6000 rpm makes 141 / 138 / 137 / 137 N m on
-4 / 2 / 1 / 0.5 cm cells and 138 / 138 / 140 N m at 15 / 20 / 40 kHz, against a spread of 3-3.5 N m between
-seeds of the combustion model's random burn, and 4 cm and 2 cm cells agree within 4% at 4000-7800 rpm
-(`docs/exhaust-1d.md`, sections 2.4 and 6).
+after every fluid sub-step of the engine, and the pipes advance at their own CFL step with the fluxes the ports
+gave them, so the torque converges with the cell size and the simulation frequency: the test inline-4 at
+6000 rpm makes 141 / 138 / 137 / 137 N m on 4 / 2 / 1 / 0.5 cm cells and 140 / 138 / 139 N m at 15 / 20 / 40 kHz,
+against a spread of about 3 N m between seeds of the combustion model's random burn, and 4 cm and 2 cm cells
+agree on every length change and within 5% at 4000-7800 rpm (`docs/exhaust-1d.md`, sections 2.2, 2.4 and 6).
 
-Cost: a V8 with two 4-1 headers at `simulation_frequency: 10000` costs about 4x the lumped model with the
-default 4 cm cells and 6x with 2 cm cells (2 cm resolves up to ~2-3 kHz instead of ~1-1.5 kHz). engine-sim
+Cost: a V8 with two 4-1 headers at `simulation_frequency: 10000` costs about 3x the lumped model with the
+default 4 cm cells and 6x with 2 cm cells, an EJ25 at 20 kHz about 3x with 4 cm cells (2 cm resolves up to
+~2-3 kHz instead of ~1-1.5 kHz). engine-sim
 itself needs a simulation step of no more than about 2 degrees of crank at the highest rpm used (both exhaust
 models lose torque beyond that: the inline-4 at 6000 rpm made a third less at 10 kHz, 3.6 degrees per step);
 the calculator's fork exports set the frequency to 3 x redline for that reason.

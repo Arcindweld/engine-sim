@@ -56,6 +56,8 @@ ExhaustNetwork::ExhaustNetwork() {
     m_lastSubSteps = 0;
     m_stepOutflow = m_stepTime = 0.0;
     m_stepSubSteps = 0;
+    m_pending = 0.0;
+    m_dxMin = 0.0;
 }
 
 ExhaustNetwork::~ExhaustNetwork() {
@@ -68,6 +70,7 @@ int ExhaustNetwork::addPrimary(const PrimarySpec &spec) {
     prim.spec = spec;
     prim.lastMassFlow = 0.0;
     prim.facePressure = 0.0;
+    for (int k = 0; k < Pipe1D::FluxCount; ++k) prim.fluxSum[k] = 0.0;
     m_primaries.push_back(prim);
     return static_cast<int>(m_primaries.size()) - 1;
 }
@@ -150,10 +153,17 @@ void ExhaustNetwork::build(const Parameters &params) {
     m_outletMassFlow = 0.0;
     m_outletMassFlowDerivative = 0.0;
     m_massIn = m_massOut = 0.0;
+    m_pending = 0.0;
+    for (Primary &prim : m_primaries) {
+        for (int k = 0; k < Pipe1D::FluxCount; ++k) prim.fluxSum[k] = 0.0;
+    }
     m_initialMass = totalMass();
     m_lastSubSteps = 0;
     m_stepOutflow = m_stepTime = 0.0;
     m_stepSubSteps = 0;
+    m_dxMin = m_collector[0]->cellSize();
+    for (const Primary &prim : m_primaries) m_dxMin = std::min(m_dxMin, prim.pipe.cellSize());
+    for (const Pipe1D *p : m_collector) m_dxMin = std::min(m_dxMin, p->cellSize());
     m_built = true;
 }
 
@@ -177,7 +187,7 @@ double ExhaustNetwork::orificeFlow(double CdA, double p0, double T0, double pd) 
     return CdA * std::sqrt(p0 * rho0) * psi;
 }
 
-// The port boundary at a primary's inlet face, solved before every pipe sub-step (the valve boundary of the
+// The port boundary at a primary's inlet face, solved after every fluid sub-step (the valve boundary of the
 // method of characteristics: Benson, The Thermodynamics and Gas Dynamics of Internal-Combustion Engines, vol. 1,
 // Oxford 1982; Winterbone & Pearson, Theory of Engine Manifold Design, 2000). The face pressure p_f is the
 // one at which the flow the pipe takes along its incoming characteristic (u_f = J + 2 c_f / (gamma - 1), with
@@ -195,12 +205,21 @@ double ExhaustNetwork::orificeFlow(double CdA, double p0, double T0, double pd) 
 // that explicit square-root exchange settles into a two-step oscillation of the pressure difference of about
 // rho (C_d A dt c^2 (1/V_port + 1/V_cell))^2 / 2 (kPa at 20 kHz), so the flow reversed on nearly every
 // sub-step and the results moved with the cell size and the simulation frequency.
-void ExhaustNetwork::portBoundary(Primary &prim, double dts) {
+void ExhaustNetwork::portBoundary(Primary &prim, double dts, bool held) {
     GasSystem *port = prim.spec.port;
     double F[Pipe1D::FluxCount];
+    // the face flux goes to the pipe now, or (held) into the sum the pipe takes when it next advances
+    auto deliver = [&]() {
+        if (held) {
+            for (int k = 0; k < Pipe1D::FluxCount; ++k) prim.fluxSum[k] += F[k] * dts;
+        }
+        else {
+            prim.pipe.setEndFlux(-1, F);
+        }
+    };
     if (port == nullptr) {
         portFace(prim, nullptr, dts, 0.0, F, &prim.facePressure);
-        prim.pipe.setEndFlux(-1, F);
+        deliver();
         prim.lastMassFlow = 0.0;
         return;
     }
@@ -214,7 +233,7 @@ void ExhaustNetwork::portBoundary(Primary &prim, double dts) {
     GasSystem half = *port;
     applyPortFlux(half, F1, 0.5 * dts);
     portFace(prim, &half, dts, pf1, F, &prim.facePressure);
-    prim.pipe.setEndFlux(-1, F);
+    deliver();
     prim.lastMassFlow = F[0];
     applyPortFlux(*port, F, dts);
     m_massIn += F[0] * dts;
@@ -628,9 +647,8 @@ void ExhaustNetwork::junctionN(JunctionEnd *ends, int count, Junction &jn) const
     }
 }
 
-void ExhaustNetwork::applyBoundaries(double dts) {
-    // the ports (the face flux of each primary's inlet, and the port volume's change over the sub-step)
-    for (Primary &prim : m_primaries) portBoundary(prim, dts);
+// The junctions and the open end, from the pipes' current state.
+void ExhaustNetwork::applyNetworkBoundaries() {
     junctionN(m_junctionEnds.data(), static_cast<int>(m_junctionEnds.size()), m_junction);
     for (size_t q = 1; q < m_collector.size(); ++q) {
         junction2(*m_collector[q - 1], *m_collector[q], m_collectorJunctions[q]);
@@ -639,13 +657,37 @@ void ExhaustNetwork::applyBoundaries(double dts) {
         +1, m_params.atmosphericPressure, m_params.atmosphericTemperature, m_atmScalars);
 }
 
-void ExhaustNetwork::advance(double dt) {
-    if (!m_built || !(dt > 0)) return;
+double ExhaustNetwork::cflStep() const {
+    double smax = 0.0;
+    for (const Primary &prim : m_primaries) smax = std::max(smax, prim.pipe.maxSignalSpeed());
+    for (const Pipe1D *p : m_collector) smax = std::max(smax, p->maxSignalSpeed());
+    return m_params.cfl * m_dxMin / std::max(smax, 1.0);
+}
 
-    double dxMin = m_collector[0]->cellSize();
-    for (const Primary &prim : m_primaries) dxMin = std::min(dxMin, prim.pipe.cellSize());
-    for (const Pipe1D *p : m_collector) dxMin = std::min(dxMin, p->cellSize());
+// The held pipes catch up with the ports: one step over the time the ports have run ahead, with each inlet face
+// flux the average of what its port gave (so the port and the pipe exchange exactly the same mass, energy and
+// species), the junctions and the open end from the held state.
+void ExhaustNetwork::syncPipes() {
+    if (!(m_pending > 0)) return;
+    const double D = m_pending;
+    for (Primary &prim : m_primaries) {
+        double F[Pipe1D::FluxCount];
+        for (int k = 0; k < Pipe1D::FluxCount; ++k) {
+            F[k] = prim.fluxSum[k] / D;
+            prim.fluxSum[k] = 0.0;
+        }
+        prim.pipe.setEndFlux(-1, F);
+    }
+    applyNetworkBoundaries();
+    for (Primary &prim : m_primaries) prim.pipe.advance(D);
+    for (Pipe1D *p : m_collector) p->advance(D);
+    m_stepOutflow += m_collector.back()->endMassFlow(+1) * D;
+    ++m_stepSubSteps;
+    m_pending = 0.0;
+}
 
+// Ports and pipes advanced together, CFL sub-stepped.
+void ExhaustNetwork::advanceLockStep(double dt) {
     Pipe1D *outlet = m_collector.back();
     double outflow = 0.0;
     double remaining = dt;
@@ -653,17 +695,9 @@ void ExhaustNetwork::advance(double dt) {
     // The primitive state is kept current by Pipe1D::advance(); only the
     // initial state after build() or a setCellState() needs computePrimitives().
     while (remaining > 1e-15) {
-        double smax = 0.0;
-        for (Primary &prim : m_primaries) {
-            smax = std::max(smax, prim.pipe.maxSignalSpeed());
-        }
-        for (Pipe1D *p : m_collector) {
-            smax = std::max(smax, p->maxSignalSpeed());
-        }
-        const double dtCfl = m_params.cfl * dxMin / std::max(smax, 1.0);
-        const double dts = std::min(remaining, dtCfl);
-
-        applyBoundaries(dts);
+        const double dts = std::min(remaining, cflStep());
+        for (Primary &prim : m_primaries) portBoundary(prim, dts, false);
+        applyNetworkBoundaries();
         for (Primary &prim : m_primaries) prim.pipe.advance(dts);
         for (Pipe1D *p : m_collector) p->advance(dts);
 
@@ -672,14 +706,33 @@ void ExhaustNetwork::advance(double dt) {
         ++subSteps;
         if (subSteps > 10000) break;   // safety against a stalled CFL loop
     }
-
     m_stepOutflow += outflow;
-    m_stepTime += dt;
     m_stepSubSteps += subSteps;
+}
+
+void ExhaustNetwork::advance(double dt) {
+    if (!m_built || !(dt > 0)) return;
+    if (m_params.holdPipes) {
+        double dtCfl = cflStep();
+        // the pipes catch up first if this sub-step would put the ports more than one CFL step ahead of them
+        if (m_pending + dt > dtCfl) {
+            syncPipes();
+            dtCfl = cflStep();
+        }
+        if (dt < dtCfl) {
+            for (Primary &prim : m_primaries) portBoundary(prim, dt, true);
+            m_pending += dt;
+            m_stepTime += dt;
+            return;
+        }
+    }
+    advanceLockStep(dt);
+    m_stepTime += dt;
 }
 
 void ExhaustNetwork::finishStep() {
     if (!m_built || !(m_stepTime > 0)) return;
+    syncPipes();
     const double massFlow = m_stepOutflow / m_stepTime;
     m_outletMassFlowDerivative = (massFlow - m_outletMassFlow) / m_stepTime;
     m_outletMassFlow = massFlow;
@@ -715,16 +768,18 @@ GasSystem::Mix ExhaustNetwork::outletMix() const {
     return mix;
 }
 
+// Both include the gas the ports gave up (or took) while the pipes were held: in transit at the inlet faces until
+// the pipes advance.
 double ExhaustNetwork::totalMass() const {
     double m = 0.0;
-    for (const Primary &prim : m_primaries) m += prim.pipe.totalMass();
+    for (const Primary &prim : m_primaries) m += prim.pipe.totalMass() + prim.fluxSum[0];
     for (const Pipe1D *p : m_collector) m += p->totalMass();
     return m;
 }
 
 double ExhaustNetwork::totalEnergy() const {
     double e = 0.0;
-    for (const Primary &prim : m_primaries) e += prim.pipe.totalEnergy();
+    for (const Primary &prim : m_primaries) e += prim.pipe.totalEnergy() + prim.fluxSum[2];
     for (const Pipe1D *p : m_collector) e += p->totalEnergy();
     return e;
 }

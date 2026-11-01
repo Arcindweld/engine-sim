@@ -7,12 +7,14 @@
 // Coupling to the rest of engine-sim: each primary's inlet is fed from the
 // cylinder's exhaust-port GasSystem (the lumped runner volume that the cylinder
 // already flows into) through a compressible orifice whose effective area is
-// derived from the script's `primary_flow_rate`.  The network advances after
-// every fluid sub-step of the engine (CFL sub-stepped inside); every pipe
-// sub-step first solves each port boundary at the primary's inlet face (orifice
-// flow matched to the pipe's incoming characteristic) and moves the same mass,
-// enthalpy and species between the port volume and the pipe, so what leaves a
-// port GasSystem arrives in the pipe exactly.
+// derived from the script's `primary_flow_rate`.  After every fluid sub-step of
+// the engine the network solves each port boundary at the primary's inlet face
+// (orifice flow matched to the pipe's incoming characteristic) and moves the
+// same mass, enthalpy and species between the port volume and the pipe, so what
+// leaves a port GasSystem arrives in the pipe exactly. The pipes advance at
+// their own CFL step with the face fluxes the ports gave them meanwhile
+// (Parameters::holdPipes), or with every sub-step, CFL sub-stepped inside, when
+// their CFL step is the shorter one.
 
 #ifndef ATG_ENGINE_SIM_EXHAUST_NETWORK_H
 #define ATG_ENGINE_SIM_EXHAUST_NETWORK_H
@@ -34,6 +36,12 @@ class ExhaustNetwork {
             double atmosphericTemperature = 298.15;
             double initialTemperature = 298.15;
             double cfl = 0.8;
+            // Multi-rate stepping: while the fluid sub-step is shorter than the pipes' CFL step, the port
+            // boundaries are solved every sub-step against the pipes' held state (the incoming characteristic of
+            // each primary's first cell held, as the method of characteristics holds it over a step), their face
+            // fluxes are accumulated, and the pipes advance once per CFL step (and at the end of every simulation
+            // step) with the averaged fluxes. false: the pipes advance with every sub-step (lock-step).
+            bool holdPipes = true;
             double molarMass = 0.02897;         // kg/mol of the GasSystem gas
             int degreesOfFreedom = 5;           // GasSystem gas model -> gamma = 1 + 2/dof
         };
@@ -50,6 +58,7 @@ class ExhaustNetwork {
             Pipe1D pipe;
             double lastMassFlow;     // kg/s into the pipe, last sub-step
             double facePressure;     // last solution at the inlet face, the next solve's start
+            double fluxSum[Pipe1D::FluxCount];   // face flux x time taken from the port while the pipes are held
         };
 
         struct Junction {
@@ -67,9 +76,10 @@ class ExhaustNetwork {
         void build(const Parameters &params);
         inline bool isBuilt() const { return m_built; }
 
-        // Per fluid sub-step, after the cylinders flowed into their ports: advance the pipes by dt (CFL
-        // sub-stepped inside). Each sub-step solves the port boundaries first: the flow between each port
-        // GasSystem and its primary's inlet face, which updates the port volume by the same flux.
+        // Per fluid sub-step, after the cylinders flowed into their ports: solve the port boundaries (the flow
+        // between each port GasSystem and its primary's inlet face, which updates the port volume by the same
+        // flux) and advance the pipes by dt, CFL sub-stepped inside; with holdPipes the pipes advance once per
+        // CFL step instead, with the fluxes the ports gave them meanwhile (see Parameters::holdPipes).
         void advance(double dt);
         // Once per simulation step: the outlet flow averaged over the step's advances, its derivative (the
         // radiated sound) and the mass account.
@@ -119,11 +129,14 @@ class ExhaustNetwork {
         void junctionN(JunctionEnd *ends, int count, Junction &j) const;
 
     private:
-        void portBoundary(Primary &prim, double dts);
+        void portBoundary(Primary &prim, double dts, bool held);
         void portFace(const Primary &prim, const GasSystem *port, double dts, double guess, double *flux,
                       double *facePressure) const;
         void applyPortFlux(GasSystem &port, const double *flux, double dt) const;
-        void applyBoundaries(double dts);
+        void applyNetworkBoundaries();
+        double cflStep() const;
+        void syncPipes();
+        void advanceLockStep(double dt);
         double gammaValue() const { return m_gamma; }
 
     private:
@@ -150,6 +163,8 @@ class ExhaustNetwork {
         // accumulated by advance() over the current simulation step
         double m_stepOutflow, m_stepTime;
         int m_stepSubSteps;
+        double m_pending;            // time the ports are ahead of the held pipes (holdPipes)
+        double m_dxMin;
 };
 
 #endif /* ATG_ENGINE_SIM_EXHAUST_NETWORK_H */

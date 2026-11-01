@@ -43,9 +43,10 @@ struct RunResult {
 // Compile a script, crank it for up to `crank` seconds at WOT, then hold it on
 // the dyno at `holdRpm` for `hold` seconds; torque and rpm are averaged over the
 // last `average` seconds.
-RunResult runScript(const std::string &path, double crank, double holdRpm, double hold, double average = 0.5) {
+RunResult runScript(const std::string &path, double crank, double holdRpm, double hold, double average = 0.5,
+                    unsigned seed = 12345) {
     RunResult res;
-    std::srand(12345);
+    std::srand(seed);   // the combustion model scales each burn by rand(): the same sequence for every run
     es_script::Compiler compiler;
     compiler.initialize();
     if (!compiler.compile(path.c_str())) {
@@ -376,9 +377,13 @@ TEST_F(EngineTests, LegacyModeKeepsLumpedModel) {
 // Physics check: primary length changes the torque of the 1-D model (header tuning) but not that of the legacy
 // model beyond its small volume effect, and the tuning is the solution's, not the grid's: the 2.0 L inline-4 with a
 // 4-1 header (721 mm primaries, 44 mm) from test/data, held at 6000 rpm, with the primaries 10% shorter and 10%
-// longer, on the default 4 cm cells and on 2 cm cells. Both grids give the same torque within 8% and the same
-// change with length within a third. (With the first, cell-source port coupling the two grids disagreed in sign
-// for the same change: 180.7 -> 157.2 N m at 4 cm, 170.6 -> 185.6 N m at 2 cm.)
+// longer, on the default 4 cm cells and on 2 cm cells. Both grids give the same torque within 8%, the same sign
+// of the change with length and its size within a half. Each torque is the mean of three runs with different
+// random-burn seeds: one run moves by up to 2.4 % with the seed, so the change between two single runs (about
+// 12 N m) carries about 3 N m of seed noise (the headless runner's seeds gave -9.7 to -15.1 N m on 2 cm cells,
+// means -12.0 at 4 cm and -11.7 at 2 cm), and the three-seed mean still about 2 N m, so a third (3-4 N m) is
+// inside the noise. (With the first, cell-source port coupling the two grids disagreed in sign for the same
+// change: 180.7 -> 157.2 N m at 4 cm, 170.6 -> 185.6 N m at 2 cm.)
 TEST_F(EngineTests, PrimaryLengthTunesOnlyTheOneDModel) {
     const std::string base = readFile("test/data/exhaust_tuner_i4.mr");
     const std::string key = "primary_tube_length: 720.969 * units.mm";
@@ -387,11 +392,17 @@ TEST_F(EngineTests, PrimaryLengthTunesOnlyTheOneDModel) {
     auto torqueFor = [&](const std::string &engineText, const std::string &tag) {
         const std::string path = "test_tune_" + tag + ".mr";
         std::ofstream(path) << engineText;     // the file defines and calls main()
-        // 1.5 s averaged (75 cycles): the combustion model's cycle-to-cycle scatter moves a 0.5 s mean by 1-2 %
-        const RunResult r = runScript(path, 2.0, 6000.0, 2.5, 1.5);
+        // 1.5 s averaged (75 cycles) and three seeds: the combustion model's cycle-to-cycle scatter moves a 0.5 s
+        // mean by 1-2 %, and a 1.5 s mean by up to 2.4 % with the seed
+        double sum = 0.0;
+        const unsigned seeds[3] = { 12345, 1, 2 };
+        for (unsigned seed : seeds) {
+            const RunResult r = runScript(path, 2.0, 6000.0, 2.5, 1.5, seed);
+            EXPECT_TRUE(r.compiled && r.started && !r.nan) << tag << ", seed " << seed;
+            sum += r.meanTorque;
+        }
         std::remove(path.c_str());
-        EXPECT_TRUE(r.compiled && r.started && !r.nan) << tag;
-        return r.meanTorque;
+        return sum / 3;
     };
 
     double tq4[2], tq2[2], tqLegacy[2];
@@ -416,5 +427,5 @@ TEST_F(EngineTests, PrimaryLengthTunesOnlyTheOneDModel) {
     EXPECT_LT(changeLegacy, 0.03);
     for (int i = 0; i < 2; ++i) EXPECT_NEAR(tq4[i], tq2[i], 0.08 * std::fabs(tq2[i])) << (i == 0 ? "short" : "long");
     EXPECT_GT(d4 * d2, 0.0) << "the two grids disagree on the direction of the change";
-    EXPECT_NEAR(d4, d2, std::fabs(d2) / 3) << "the two grids disagree on the size of the change";
+    EXPECT_NEAR(d4, d2, std::fabs(d2) / 2) << "the two grids disagree on the size of the change";
 }
